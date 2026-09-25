@@ -1,6 +1,6 @@
 # Photo → Drawing
 
-Turn any photo into **glowing line art** or a **flat, bold-outlined cartoon of you**, and watch it get drawn live. You can save the result as an image or a video, or share it straight from your phone.
+Turn any photo into **glowing line art**, a **flat, bold-outlined cartoon**, or a **detailed digital illustration**, and watch it get drawn live. You can save the result as an image or a video, or share it straight from your phone.
 
 Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no build step. The one runtime dependency is Google's MediaPipe Tasks Vision library, which is loaded from a CDN only when it's needed.
 
@@ -8,9 +8,19 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 
 ---
 
-## How the two styles work
+## How the three styles work
 
 **Works on all kinds of photos.** Both styles trace lines from a *texture-free* copy of the photo (the Kuwahara filter smooths away fabric patterns, carpet, skin pores and noise but keeps real edges), then drop "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Colors like skin and hair are sampled from the mid-tones, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
+
+**Illustration** keeps the photo's real shapes, lighting and detail (so it keeps the person's likeness and works on any picture) and re-renders it as a clean digital illustration, following the classic "image abstraction" recipe from computer-graphics research:
+1. **Lab color**, to treat lightness and color separately.
+2. **Edge-aware smoothing** with the *domain transform* filter. It turns skin, fabric and walls into clean surfaces while every real edge stays sharp. It's region-aware via MediaPipe segmentation: skin is smoothest, hair and clothes keep detail, and the background is more painterly.
+3. **Even skin tone:** camera-flash glare is compressed and pulled back to the skin's real mid-tone color.
+4. **Soft shading bands**, a gently stepped version of the photo's lighting.
+5. **XDoG ink lines** (eXtended Difference of Gaussians): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
+6. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips.
+
+In live mode, the pen inks the line art first, then the colors wash in underneath. Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
 **Line art** uses classic computer vision, written from scratch: Sobel edges → non-maximum suppression → Canny-style hysteresis → contour tracing → smoothing → RDP simplification → smooth curves. It works at 1400px for fine lines and lots of detail. A **face landmark model** finds faces: each one (with its hair) is re-traced from a zoomed-in crop, and the exact outlines of the eyes, irises, eyebrows, nose, lips and jaw are added from the landmarks.
 
@@ -68,6 +78,7 @@ The sections in `app.js` are:
 3. **Painted fallback + shared painting helpers**: Kuwahara, k-means++, color grading, paper grain, reveal animation, sky detection, painted skies, light glow
 4. Web Worker helper
 4b. **Mode 2: Cartoon**: loading MediaPipe, segmentation, face landmarks, flat coloring and cel shading, drawing the face, inking the outlines, cartoon background
+4c. **Mode 3: Illustration**: Lab color, domain-transform smoothing, skin-tone evening, soft quantization, XDoG ink, speck removal, Zhang–Suen thinning (for the live pen), face refinement
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback

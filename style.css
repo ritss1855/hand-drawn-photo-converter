@@ -135,7 +135,8 @@ body {
 
 .mode-picker { border: 0; margin: 0; padding: 0; }
 .mode-picker legend { font-weight: 600; margin-bottom: 10px; padding: 0; }
-.mode-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.mode-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+@media (max-width: 420px) { .mode-picker { grid-template-columns: 1fr 1fr; } }
 .mode-picker legend { grid-column: 1 / -1; }
 
 .mode-option { position: relative; cursor: pointer; }
@@ -170,6 +171,14 @@ body {
     radial-gradient(ellipse at 20% 120%, #4f7f4c 0 45%, transparent 46%),
     radial-gradient(circle at 78% 30%, #fff1c9 0 9px, transparent 10px),
     linear-gradient(#9fcff0, #d8ecf5 70%);
+}
+
+.swatch-illustration {
+  background:
+    radial-gradient(circle at 50% 42%, #c98a64 0 13px, transparent 14px),
+    radial-gradient(ellipse at 50% 30%, #1d1412 0 20px, transparent 21px),
+    radial-gradient(ellipse at 50% 120%, #232027 0 30px, transparent 31px),
+    linear-gradient(160deg, #7a5a44, #3c3446);
 }
 
 .field-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
