@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Photo to Drawing — line art &amp; cartoons in your browser</title>
+  <meta name="description" content="Turn any photo into glowing line art or a flat, bold-outlined cartoon of you. Watch it get drawn live and share the video. Runs 100% in your browser — photos never leave your device.">
+  <meta name="theme-color" content="#0f0e17">
+
+  <!-- Open Graph (Facebook, iMessage, WhatsApp, Discord, LinkedIn link previews) -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Photo to Drawing">
+  <meta property="og:description" content="Turn any photo into glowing line art or a cartoon — and watch it get drawn live. Runs entirely in your browser.">
+  <meta property="og:site_name" content="Photo to Drawing">
+
+  <!-- Twitter / X card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Photo to Drawing">
+  <meta name="twitter:description" content="Turn any photo into glowing line art or a cartoon — and watch it get drawn live.">
+
+  <!-- Favicon: a tiny inline SVG pencil, so there is no extra file to host -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='1' x2='1' y2='0'%3E%3Cstop offset='0' stop-color='%23ff8a5b'/%3E%3Cstop offset='1' stop-color='%23b36bff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%230f0e17'/%3E%3Cpath d='M14 50l4-12 24-24 8 8-24 24z' fill='url(%23g)'/%3E%3Cpath d='M14 50l4-12 8 8z' fill='%23ffe3c2'/%3E%3C/svg%3E">
+
+  <!-- Relative paths only, so the site works inside a GitHub Pages sub-folder -->
+  <!-- "?v=10" makes browsers fetch the new files after an update instead of an old cached copy.
+       Bump the number whenever you change style.css or app.js. -->
+  <link rel="stylesheet" href="style.css?v=10">
+  <script src="app.js?v=10" defer></script>
+</head>
+<body>
+
+  <!-- ============================ MAIN VIEW ============================ -->
+  <main id="main-view" class="view">
+    <header class="hero">
+      <h1>Photo <span class="arrow">→</span> <span class="grad">Drawing</span></h1>
+      <p>Turn a photo into glowing line art or a cartoon of you, and watch it get drawn.</p>
+    </header>
+
+    <section class="card">
+      <label for="file-input" id="drop-zone" class="drop-zone">
+        <input type="file" id="file-input" class="sr-only" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/avif,image/*">
+        <div id="drop-empty" class="drop-empty">
+          <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M4 16l4.5-4.5a2 2 0 0 1 2.8 0L16 16m-2-2 1.5-1.5a2 2 0 0 1 2.8 0L20 14M14 8h.01M6 20h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z"/></svg>
+          <strong>Tap to upload a photo</strong>
+          <span>or drag one here · JPG, PNG, WebP, GIF</span>
+        </div>
+        <img id="preview" class="preview" alt="Preview of your uploaded photo" hidden>
+      </label>
+      <p id="upload-msg" class="msg" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card options">
+      <fieldset class="mode-picker">
+        <legend>Style</legend>
+        <label class="mode-option">
+          <input type="radio" name="mode" value="lineart" checked>
+          <span class="mode-card">
+            <span class="swatch swatch-lineart" aria-hidden="true"></span>
+            <strong>Line art</strong>
+            <small>Glowing colorful lines on black</small>
+          </span>
+        </label>
+        <label class="mode-option">
+          <input type="radio" name="mode" value="cartoon">
+          <span class="mode-card">
+            <span class="swatch swatch-storybook" aria-hidden="true"></span>
+            <strong>Cartoon</strong>
+            <small>Flat colors, bold outlines, drawn-on face</small>
+          </span>
+        </label>
+      </fieldset>
+
+      <div class="field">
+        <div class="field-row">
+          <label for="detail">Edge detail</label>
+          <output id="detail-value" for="detail">50</output>
+        </div>
+        <input type="range" id="detail" min="1" max="100" step="1" value="50">
+        <div class="range-hints"><span>Fewer lines</span><span>More lines</span></div>
+      </div>
+
+      <label class="switch-row" for="live-toggle">
+        <span>Show it drawn out live</span>
+        <input type="checkbox" id="live-toggle" class="sr-only" role="switch">
+        <span class="switch" aria-hidden="true"></span>
+      </label>
+
+      <div class="field" id="speed-field" hidden>
+        <div class="field-row">
+          <label for="speed">Drawing speed</label>
+          <output id="speed-value" for="speed">1.0x</output>
+        </div>
+        <input type="range" id="speed" min="0.5" max="2" step="0.1" value="1">
+        <div class="range-hints"><span>0.5x slower</span><span>2x faster</span></div>
+      </div>
+
+      <div class="field" id="music-field" hidden>
+        <div class="field-row">
+          <label for="music">Music while it draws</label>
+          <button id="music-preview" class="btn mini" type="button" disabled>▶ Preview</button>
+        </div>
+        <select id="music" class="select">
+          <option value="none">No music</option>
+          <option value="lofi">Lo-fi chill</option>
+          <option value="piano">Dreamy piano</option>
+          <option value="chip">Upbeat chiptune</option>
+          <option value="synth">Night drive synth</option>
+          <option value="file">Your own song…</option>
+        </select>
+        <input type="file" id="music-file" class="sr-only" accept="audio/*">
+        <p id="music-msg" class="msg">The music is recorded into "Save as video" too.</p>
+      </div>
+    </section>
+
+    <button id="generate-btn" class="btn primary big" disabled>Generate</button>
+
+    <footer class="footer">
+      🔒 Everything runs in your browser. Your photos are never uploaded or stored.<br>
+      The AI models download once and run on your device.<br>
+      <small class="version">v9 · Music while it draws</small>
+    </footer>
+  </main>
+
+  <!-- ============================ RESULT VIEW ============================ -->
+  <section id="result-view" class="view result-view" hidden>
+    <header class="result-bar">
+      <button id="back-btn" class="btn ghost" type="button">← Back</button>
+      <h2 id="result-title">Line art</h2>
+      <span class="spacer"></span>
+    </header>
+
+    <div class="stage">
+      <canvas id="result-canvas" hidden></canvas>
+
+      <div id="loading" class="loading" hidden>
+        <div class="spinner" aria-hidden="true"></div>
+        <p id="loading-text">Painting…</p>
+      </div>
+
+      <div id="empty-msg" class="empty-msg" hidden>
+        <div class="empty-emoji" aria-hidden="true">🫥</div>
+        <p id="empty-text"></p>
+        <button id="empty-back-btn" class="btn" type="button">Try other settings</button>
+      </div>
+    </div>
+
+    <div id="progress" class="progress" hidden><div id="progress-bar" class="progress-bar"></div></div>
+    <p id="result-status" class="msg center" role="status" aria-live="polite"></p>
+
+    <div class="actions">
+      <button id="save-video-btn" class="btn" type="button" disabled>Save as video</button>
+      <button id="save-image-btn" class="btn" type="button" disabled>Save as image</button>
+      <button id="share-btn" class="btn primary" type="button" disabled>Share</button>
+    </div>
+    <p id="video-note" class="note" hidden></p>
+  </section>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

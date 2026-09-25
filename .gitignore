@@ -1,0 +1,6 @@
+# Local editor/assistant settings (not part of the website)
+.claude/
+.vscode/
+
+# Test files
+_test-photo.jpg
