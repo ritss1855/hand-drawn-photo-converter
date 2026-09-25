@@ -10,6 +10,8 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 
 ## How the two styles work
 
+**Works on all kinds of photos.** Both styles trace lines from a *texture-free* copy of the photo (the Kuwahara filter smooths away fabric patterns, carpet, skin pores and noise but keeps real edges), then drop "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Colors like skin and hair are sampled from the mid-tones, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
+
 **Line art** uses classic computer vision, written from scratch: Sobel edges → non-maximum suppression → Canny-style hysteresis → contour tracing → smoothing → RDP simplification → smooth curves. It works at 1400px for fine lines and lots of detail. A **face landmark model** finds faces: each one (with its hair) is re-traced from a zoomed-in crop, and the exact outlines of the eyes, irises, eyebrows, nose, lips and jaw are added from the landmarks.
 
 **Cartoon** doesn't filter the photo. It **draws** a cartoon of it, the way an illustrator works from a reference photo:

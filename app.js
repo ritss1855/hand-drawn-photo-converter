@@ -536,6 +536,57 @@ function filterAndSimplify(paths, minPoints, epsilon) {
 }
 
 /**
+ * STEP 8c' — Texture suppression.
+ * Patterned things (carpet, polka dots, knitted fabric, grass, gravel)
+ * produce hundreds of short edge fragments that turn a drawing into
+ * scribbles. Real contours (a jaw, an arm, a couch edge) are LONG, while
+ * texture is lots of SHORT lines crammed close together.
+ * So we split the image into a grid of small cells and measure how much
+ * traced line falls in each cell (the "line density"). A short stroke that
+ * lives mostly in dense cells is texture, and is dropped. Long strokes always
+ * survive, even when they run through a busy area.
+ */
+function suppressTexture(strokes, w, h, { maxDensity = 0.09, longLen = 0 } = {}) {
+  const cell = Math.max(12, Math.round(Math.max(w, h) / 60));
+  const gw = Math.ceil(w / cell), gh = Math.ceil(h / cell);
+  const count = new Float32Array(gw * gh);
+  for (const s of strokes) {
+    const perPoint = s.rawLength / s.points.length; // simplified points stand for this many traced pixels each
+    for (const p of s.points) count[clamp(p.y / cell | 0, 0, gh - 1) * gw + clamp(p.x / cell | 0, 0, gw - 1)] += perPoint;
+  }
+  // Density = traced pixels per pixel of cell area, averaged over each cell's 3×3 neighborhood.
+  const density = new Float32Array(gw * gh);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      let sum = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy < 0 || xx < 0 || yy >= gh || xx >= gw) continue;
+        sum += count[yy * gw + xx]; n++;
+      }
+      density[y * gw + x] = sum / n / (cell * cell);
+    }
+  }
+  const minLong = longLen || Math.max(w, h) * 0.06;
+  return strokes.filter((s) => {
+    if (s.rawLength >= minLong || s.feature) return true;
+    let d = 0;
+    for (const p of s.points) d += density[clamp(p.y / cell | 0, 0, gh - 1) * gw + clamp(p.x / cell | 0, 0, gw - 1)];
+    return d / s.points.length < maxDensity;
+  });
+}
+
+/**
+ * A copy of the image with texture smoothed away but edges kept (the
+ * Kuwahara filter from section 3), used as the source for tracing lines.
+ * Tracing this instead of the raw photo means fabric weave, skin pores,
+ * carpet and noise don't become lines, while the outlines of real shapes do.
+ */
+function textureFree(rgba, w, h, radius) {
+  return radius > 0 ? kuwaharaFilter(rgba, w, h, radius) : rgba;
+}
+
+/**
  * STEP 9 — Order strokes naturally.
  * An artist blocks in the big shapes first, then fills in details near where
  * the pen already is. We copy that:
@@ -779,12 +830,17 @@ function createLineArtDrawer(ctx, art) {
 /** Build the Line art result from an <img>. */
 async function buildLineArt(image, detail, onStatus = () => {}) {
   const { width: w, height: h, data } = downscaleImage(image, SETTINGS.maxSideLineArt);
-  // The slider is shifted toward "more detail": 50 on the slider traces like 75.
-  const effectiveDetail = Math.min(100, 50 + detail * 0.5);
+  // The slider is shifted a little toward "more detail": 50 on the slider traces like 65.
+  const effectiveDetail = Math.min(100, 35 + detail * 0.6);
   const gain = Math.max(1, w / (image.naturalWidth || image.width)); // how much a small photo was enlarged
-  // lowRatio 0.3: hysteresis follows fainter edges along real contours, so
-  // lines continue further and fine details (creases, textures) survive.
-  let raw = extractRawStrokes(data, w, h, { detail: effectiveDetail, strictness: 1, minPoints: 6, gain, lowRatio: 0.3 });
+  const sizeFactor = Math.max(w, h) / 800;
+  // Trace a texture-free copy (edges kept, fabric/carpet/skin texture
+  // smoothed away), then drop leftover texture scribbles. This is what keeps
+  // busy photos clean. lowRatio 0.35: hysteresis follows fainter edges along
+  // real contours, so lines continue further.
+  const smooth = textureFree(data, w, h, Math.max(2, Math.round(Math.max(w, h) / 450)));
+  let raw = extractRawStrokes(smooth, w, h, { detail: effectiveDetail, strictness: 1, minPoints: Math.round(8 * sizeFactor), gain, lowRatio: 0.35 });
+  raw = suppressTexture(raw, w, h);
 
   // Faces deserve extra care: find them, re-trace each one from a zoomed-in
   // crop, then add precise feature outlines from the face landmarks.
@@ -810,8 +866,7 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
 
   const strokes = finalizeStrokes(raw);
   // Line weight is based on stroke length; measure it relative to an 800px
-  // image so weights look the same at any processing size.
-  const sizeFactor = Math.max(w, h) / 800;
+  // image (sizeFactor) so weights look the same at any processing size.
   for (const s of strokes) {
     s.color = sampleStrokeColor(s, data, w, h);
     s.prominence = s.feature ? 0.7 : Math.sqrt(Math.min(1, s.rawLength / (240 * sizeFactor)));
@@ -1694,11 +1749,12 @@ function addFaceDetailLines(raw, w, h, source, faces, detail) {
     const cctx = crop.getContext('2d', { willReadFrequently: true });
     cctx.imageSmoothingQuality = 'high';
     cctx.drawImage(source, r.x, r.y, r.size, r.size, 0, 0, C, C);
-    const data = cctx.getImageData(0, 0, C, C).data;
-
-    // Slightly stricter than the main pass and longer minimum strokes: we want
-    // clean eyes, brows, nose and lips, not every pore.
-    const faceStrokes = extractRawStrokes(data, C, C, { detail, strictness: 1.3, minPoints: 14 });
+    // Smooth away skin texture first (Kuwahara), and trace a little stricter
+    // than the main pass with longer minimum strokes: we want clean eyes,
+    // brows, nose, lips and hair shapes, not every pore.
+    const data = textureFree(cctx.getImageData(0, 0, C, C).data, C, C, 2);
+    const faceStrokes = suppressTexture(
+      extractRawStrokes(data, C, C, { detail, strictness: 1.3, minPoints: 14 }), C, C, { maxDensity: 0.12 });
     const f = size / C; // crop pixels → processing pixels
     const mapped = [];
     for (const s of faceStrokes) {
@@ -1849,6 +1905,34 @@ function medianColor(rgba, labels, label) {
 }
 
 /**
+ * A robust "true color" of a region: the average of its pixels in a middle
+ * brightness band (between the `lo` and `hi` brightness percentiles),
+ * ignoring near-white glare and colorless pixels (below `minSat` saturation).
+ * A plain median fails with camera flash or strong light: the lit parts of a
+ * face can be almost white, which made darker skin tones come out far too
+ * pale. The mid-tones hold the real color. For hair, a lower band ignores
+ * the shine so black hair stays black.
+ */
+function toneSample(rgba, labels, classes, lo = 0.25, hi = 0.5, minSat = 0) {
+  const px = [];
+  for (let i = 0; i < labels.length; i += 2) {
+    if (!classes.includes(labels[i])) continue;
+    const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    if (mx > 248) continue;                                  // blown-out glare
+    if (minSat && (mx - mn) / Math.max(1, mx) < minSat) continue; // colorless (shine, gray)
+    px.push([0.299 * r + 0.587 * g + 0.114 * b, r, g, b]);
+  }
+  if (px.length < 30) return null;
+  px.sort((a, b) => a[0] - b[0]);
+  const a = Math.floor(px.length * lo), z = Math.max(a + 1, Math.floor(px.length * hi));
+  let r = 0, g = 0, b = 0;
+  for (let k = a; k < z; k++) { r += px[k][1]; g += px[k][2]; b += px[k][3]; }
+  const n = z - a;
+  return [r / n, g / n, b / n];
+}
+
+/**
  * Majority ("mode") filter: each pixel takes the most common label in its
  * (2r+1)×(2r+1) neighborhood. It erases specks and smooths jagged borders
  * between flat color regions, which is key to the clean "vector" look.
@@ -1887,7 +1971,8 @@ const hsl = (h, s, l) => hslToRgb(h, clamp(s, 0, 1), clamp(l, 0, 1));
 /** Skin: keep the person's real skin tone, but clean and a little brighter, plus a shadow, blush and line tone. */
 function styleSkin(c) {
   const [h, s0, l0] = rgbToHsl(c[0], c[1], c[2]);
-  const s = clamp(s0 * 1.15, 0.25, 0.6), l = clamp(l0 * 1.06 + 0.05, 0.3, 0.86);
+  // Only a small cleanup: a touch more color and brightness. Big boosts wash out darker skin tones.
+  const s = clamp(s0 * 1.08, 0.18, 0.62), l = clamp(l0 + 0.03, 0.18, 0.86);
   return {
     base: hsl(h, s, l),
     shadow: hsl(h - 3, s + 0.02, l - 0.08),
@@ -1907,7 +1992,7 @@ function styleHair(c) {
   return {
     base: hsl(h, s, l),
     shadow: hsl(h, s, l * 0.68),
-    highlight: hsl(h, s * 0.9, l + 0.13),
+    highlight: hsl(h, s * 0.9, l + 0.09),
     brow: hsl(h, s, Math.min(l * 0.8, 0.25)),
   };
 }
@@ -2175,10 +2260,12 @@ function drawCartoonFace(ctx, pts, skin, hair, iris, shadeSide = 1) {
 async function cartoonBackground(photo, w, h, night) {
   // 10 colors and light smoothing: enough simplification to look drawn, but
   // buildings, windows and railings stay recognizable.
+  // Strong Kuwahara passes and a wide majority filter, so textured walls,
+  // carpets and foliage become calm shapes instead of blotches.
   const K = 8;
-  const { labels, centers } = await runPaintStage(photo, w, h, { radii: [5, 3], k: K, maxIter: 12 });
-  let clean = majorityFilter(labels, w, h, K, 3);
-  clean = majorityFilter(clean, w, h, K, 3);
+  const { labels, centers } = await runPaintStage(photo, w, h, { radii: [7, 5], k: K, maxIter: 12 });
+  let clean = majorityFilter(labels, w, h, K, 4);
+  clean = majorityFilter(clean, w, h, K, 4);
   const palette = [];
   for (let c = 0; c < K; c++) {
     let col = styleFlat([centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]], 0.08);
@@ -2265,10 +2352,23 @@ async function buildCartoon(image, detail, onStatus) {
   // 4. Character colors, taken from the photo.
   onStatus('Coloring…');
   await nextFrame();
-  // Skin is sampled from the brightened photo (so faces in dark photos still
-  // read as lit); hair and clothes from the ORIGINAL, so black hair stays black.
-  const skinSample = medianColor(photo, labels, SEG.FACE) || medianColor(photo, labels, SEG.BODY) || [222, 170, 138];
-  const hairSample = medianColor(data, labels, SEG.HAIR) || [35, 28, 25];
+  // Skin tone must match the person. The hue and saturation come from the
+  // ORIGINAL photo; the brightness is the original's, moved only 35% of the
+  // way toward the brightened copy (so faces in very dark photos still read
+  // as lit, without washing out someone's real skin tone). Hair and clothes
+  // come from the original too, so black hair stays black.
+  // (toneSample ignores flash glare and shine; see its comment.)
+  const skinClasses = [SEG.FACE, SEG.BODY];
+  const skinOrig = toneSample(data, labels, skinClasses, 0.25, 0.55, 0.12);
+  const skinLit = toneSample(photo, labels, skinClasses, 0.25, 0.55, 0.12);
+  let skinSample = [200, 150, 120];
+  if (skinOrig && skinLit) {
+    const [sh, ss, sl] = rgbToHsl(...skinOrig);
+    const litL = rgbToHsl(...skinLit)[2];
+    // Dark (night/indoor) photos underexpose skin, so they lean more on the brightened copy.
+    skinSample = hsl(sh, ss, sl + (litL - sl) * (night ? 0.6 : 0.35));
+  }
+  const hairSample = toneSample(data, labels, [SEG.HAIR], 0.15, 0.45) || [35, 28, 25];
   const skin = styleSkin(skinSample), hair = styleHair(hairSample);
 
   // Shading uses brightness from a heavily blurred photo (big, soft light and shadow areas only).
@@ -2286,12 +2386,13 @@ async function buildCartoon(image, detail, onStatus) {
 
   // Where hair is close, it casts a shadow onto the forehead (a classic cartoon touch).
   const hairNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.HAIR ? 1 : 0)), w, h, 5);
-  let chinY = Infinity, faceH = 0;
-  for (const pts of faces) {
-    const ys = pts.map((p) => p.y);
-    chinY = Math.min(chinY, pts[LM.chin].y);
-    faceH = Math.max(faceH, Math.max(...ys) - Math.min(...ys));
-  }
+  // The face casts a shadow onto the neck just below the jaw. "Just below the
+  // jaw" = body-skin pixels close to the face (a blurred face mask) and
+  // lower than the face's center, which follows the jawline even when the
+  // head is tilted (a straight horizontal cut looked like a band).
+  const faceNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.FACE ? 1 : 0)), w, h, 8);
+  let faceCenterY = Infinity;
+  for (const pts of faces) faceCenterY = Math.min(faceCenterY, centroid(pick(pts, LM.faceOval)).y);
 
   // Tone maps (0 = shadow, 1 = base, 2 = highlight), smoothed into blobby cel shapes.
   const shadowRaw = new Float32Array(w * h), highlightRaw = new Float32Array(w * h);
@@ -2300,13 +2401,13 @@ async function buildCartoon(image, detail, onStatus) {
     if (l === SEG.FACE) {
       shadowRaw[i] = hairNear[i] > 0.25 || lum[i] < faceLum * 0.7 ? 1 : 0;
     } else if (l === SEG.BODY) {
-      const underChin = faces.length ? y < chinY + faceH * 0.3 : false;
-      shadowRaw[i] = underChin || lum[i] < faceLum * 0.65 ? 1 : 0;
+      const underJaw = faces.length && y > faceCenterY && faceNear[i] > 0.12;
+      shadowRaw[i] = underJaw || lum[i] < faceLum * 0.68 ? 1 : 0;
     } else if (l === SEG.HAIR) {
       // Hair uses a less-blurred brightness so curls and clumps show as
       // separate shapes: darker clumps, the base, and lighter shine.
       shadowRaw[i] = lumHair[i] < hairLumFine * 0.85 ? 1 : 0;
-      highlightRaw[i] = lumHair[i] > hairLumFine * 1.3 + 6 ? 1 : 0;
+      highlightRaw[i] = lumHair[i] > hairLumFine * 1.6 + 10 ? 1 : 0; // only the brightest shine (flash glare made big blobs)
     } else if (l === SEG.CLOTHES) {
       shadowRaw[i] = 0; // set below, relative to the clothes' own brightness
     }
@@ -2328,7 +2429,9 @@ async function buildCartoon(image, detail, onStatus) {
     shadowRaw[i] = lum[i] < clothesLum * 0.8 ? 1 : 0;
     detailRaw[i] = lumLight[i] > clothesSharpLum + 75 ? 1 : 0;
   }
-  const detailMask = gaussianBlur(detailRaw, w, h);
+  // Blurring 3 times before the 0.5 threshold makes tiny specks (polka dots,
+  // sparkles) vanish while real details like a logo or a zip survive.
+  const detailMask = blurTimes(detailRaw, w, h, 3);
   const detailColor = (() => {
     const tmp = new Uint8Array(w * h);
     for (let i = 0; i < tmp.length; i++) tmp[i] = detailMask[i] > 0.5 ? 1 : 0;
@@ -2412,13 +2515,18 @@ async function buildCartoon(image, detail, onStatus) {
   // from the PHOTO's real edges, but kept only well inside the clothes (so
   // they don't double the silhouette). Thinner than the outline, like an
   // illustrator's inner lines.
+  //   All inner lines are traced from a TEXTURE-FREE copy of the photo
+  //   (Kuwahara-smoothed), and texture scribbles are filtered out, so polka
+  //   dots, knit patterns, carpet and skin pores don't become lines.
+  const lineSrc = textureFree(photo, w, h, 4);
+  const insideOf = (mask, s, need) => {
+    let inside = 0;
+    for (const pt of s.points) if (mask[Math.round(pt.y) * w + Math.round(pt.x)] > 0.95) inside++;
+    return inside / s.points.length > need;
+  };
+  const innerLines = suppressTexture(extractRawStrokes(lineSrc, w, h, { detail: Math.min(100, detail + 10), strictness: 1.3, minPoints: 30 }), w, h);
   const clothesInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.CLOTHES ? 1 : 0)), w, h, 4);
-  const clothesLines = extractRawStrokes(photo, w, h, { detail: Math.min(100, detail + 10), strictness: 1.5, minPoints: 45 })
-    .filter((s) => {
-      let inside = 0;
-      for (const pt of s.points) if (clothesInner[Math.round(pt.y) * w + Math.round(pt.x)] > 0.95) inside++;
-      return inside / s.points.length > 0.85;
-    });
+  const clothesLines = innerLines.filter((s) => insideOf(clothesInner, s, 0.85));
   for (const s of clothesLines) {
     s.outlineWidth = (1.6 + 0.9 * strokeProminence(s)) / scale; // 1.6–2.5 px
     s.outlineColor = '#1a1210';
@@ -2426,12 +2534,27 @@ async function buildCartoon(image, detail, onStatus) {
   }
   personStrokes.push(...clothesLines);
 
+  // Skin lines: where an arm crosses the body, fingers, elbows and knees.
+  // Arms, hands and chest are all "body skin" to the segmenter, so without
+  // these they'd merge into one flat blob.
+  const skinInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.BODY ? 1 : 0)), w, h, 3);
+  const skinLines = innerLines.filter((s) => insideOf(skinInner, s, 0.8));
+  for (const s of skinLines) {
+    s.outlineWidth = (1.7 + 1.0 * strokeProminence(s)) / scale; // 1.7–2.7 px
+    s.outlineColor = css(mixColor(skin.line, [0, 0, 0], 0.35));
+    s.outlineAlpha = 0.9;
+  }
+  personStrokes.push(...skinLines);
+
   // Hair strands: the photo's own edges inside the hair (curls, parting,
   // clumps), drawn as fine lines. Strands along bright, shiny hair are drawn
   // in the highlight color; the rest in a darker hair tone. This is what makes
   // hair read as hair instead of a flat helmet.
   const hairInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.HAIR ? 1 : 0)), w, h, 2);
-  const hairLines = extractRawStrokes(photo, w, h, { detail: Math.min(100, detail + 30), strictness: 1.1, minPoints: 16 })
+  // (Hair uses a lighter smoothing, radius 2, so strands survive but frizz and noise don't.)
+  const hairLines = suppressTexture(
+    extractRawStrokes(textureFree(photo, w, h, 2), w, h, { detail: Math.min(100, detail + 25), strictness: 1.15, minPoints: 20 }),
+    w, h, { maxDensity: 0.12 })
     .filter((s) => {
       let inside = 0;
       for (const pt of s.points) if (hairInner[Math.round(pt.y) * w + Math.round(pt.x)] > 0.9) inside++;
@@ -2442,7 +2565,7 @@ async function buildCartoon(image, detail, onStatus) {
   for (const s of hairLines) {
     let sum = 0;
     for (const pt of s.points) sum += lumHair[Math.round(pt.y) * w + Math.round(pt.x)];
-    const shiny = sum / s.points.length > hairLumFine * 1.15;
+    const shiny = sum / s.points.length > hairLumFine * 1.3;
     s.outlineWidth = (shiny ? 1.6 : 1.3 + 0.6 * strokeProminence(s)) / scale;
     s.outlineColor = shiny ? strandLight : strandDark;
     s.outlineAlpha = shiny ? 0.8 : 0.9;
@@ -2453,7 +2576,7 @@ async function buildCartoon(image, detail, onStatus) {
   // outlines, windows, railings, the horizon), so the scene keeps its
   // structure. The Edge detail slider controls how many.
   const personNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.BG ? 0 : 1)), w, h, 3);
-  const bgRaw = extractRawStrokes(photo, w, h, { detail, strictness: 1.4, minPoints: 36 });
+  const bgRaw = suppressTexture(extractRawStrokes(lineSrc, w, h, { detail, strictness: 1.4, minPoints: 36 }), w, h, { maxDensity: 0.07 });
   const bgStrokes = bgRaw.filter((s) => {
     let inside = 0;
     for (const pt of s.points) {
