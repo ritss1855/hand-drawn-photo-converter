@@ -42,7 +42,7 @@ const SETTINGS = {
   maxUpscale: 2.5,          // small photos are enlarged (up to 2.5x) before processing, so lines come out finer
   outputLongSide: 1400,     // the result canvas is always about this big, whatever the processing size
   rdpEpsilon: 0.6,          // Ramer–Douglas–Peucker tolerance, in pixels (lower = keeps more detail)
-  maxStrokes: 9000,         // safety cap so extremely busy photos stay fast
+  maxStrokes: 12000,        // safety cap so extremely busy photos stay fast
   baseDurationMs: 8000,     // live drawing takes about 8 seconds at 1x speed
   holdFinalFrameMs: 1000,   // video keeps the finished picture on screen for 1 second
   kmeansK: 16,              // number of paint colors in Storybook mode
@@ -749,11 +749,60 @@ function resetCtx(ctx) {
  * almost-white glow instead of all turning the same orange.
  */
 function vividColor(r, g, b) {
+  const [R, G, B] = vividRGB(r, g, b);
+  return `rgb(${R | 0}, ${G | 0}, ${B | 0})`;
+}
+
+/** The same "neon" color as vividColor, as an [r, g, b] array. */
+function vividRGB(r, g, b) {
   const [hue, s, l] = rgbToHsl(r, g, b);
   const s2 = Math.min(1, s * 2.2);
   const l2 = clamp(0.56 + l * 0.3, 0.58, 0.85);
-  const [R, G, B] = hslToRgb(hue, s2, l2);
-  return `rgb(${R | 0}, ${G | 0}, ${B | 0})`;
+  return hslToRgb(hue, s2, l2);
+}
+
+/**
+ * The finished Line art, rendered straight from the flow-based ink (so every
+ * fine line and its natural thick-to-thin weight is kept, which traced pen
+ * strokes lose). Each ink pixel takes a vivid version of the photo's color
+ * there; a glow is made by shrinking the lines to 1/4 and 1/10 size and
+ * stretching them back up (a cheap, soft blur), then adding it underneath
+ * with the "lighter" blend, which makes light add up like real light.
+ */
+function renderGlowInk(ink, photo, w, h) {
+  const scale = Math.max(w, h) / 1000;
+  const n = w * h;
+  // Color source: a slightly blurred photo, so a line takes the color of
+  // its surroundings rather than one noisy pixel.
+  const chan = (c) => gaussianBlurSigma(Float32Array.from({ length: n }, (_, i) => photo[i * 4 + c]), w, h, 2 * scale);
+  const R = chan(0), G = chan(1), B = chan(2);
+  const lines = new Uint8ClampedArray(n * 4);
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const a = 1 - ink[i];
+    if (a < 0.03) continue;
+    const [r, g, b] = vividRGB(R[i], G[i], B[i]);
+    lines[j] = r; lines[j + 1] = g; lines[j + 2] = b; lines[j + 3] = 255 * a;
+  }
+  const lineCanvas = makeCanvas(w, h);
+  lineCanvas.getContext('2d').putImageData(new ImageData(lines, w, h), 0, 0);
+
+  const out = makeCanvas(w, h);
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#000';
+  octx.fillRect(0, 0, w, h);
+  octx.globalCompositeOperation = 'lighter';
+  octx.imageSmoothingQuality = 'high';
+  for (const [div, alpha] of [[4, 0.55], [10, 0.45]]) {
+    const small = makeCanvas(Math.max(1, Math.round(w / div)), Math.max(1, Math.round(h / div)));
+    const sctx = small.getContext('2d');
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(lineCanvas, 0, 0, small.width, small.height);
+    octx.globalAlpha = alpha;
+    octx.drawImage(small, 0, 0, w, h);
+  }
+  octx.globalAlpha = 1;
+  octx.drawImage(lineCanvas, 0, 0);
+  return out;
 }
 
 /**
@@ -792,8 +841,8 @@ function styleLineArtStroke(ctx, stroke, scale) {
   const p = stroke.prominence;
   ctx.strokeStyle = stroke.color;
   ctx.shadowColor = stroke.color;
-  ctx.shadowBlur = 3 + 6 * p;
-  ctx.lineWidth = (1.0 + 1.6 * p) / scale; // 1.0–2.6 px on the 1400px output: fine, crisp lines
+  ctx.shadowBlur = 2 + 6 * p;
+  ctx.lineWidth = (1.2 + 2.2 * p) / scale; // 1.2–3.4 px on the 1400px output: fine details, bold contours
   ctx.globalAlpha = 0.7 + 0.3 * p;
 }
 
@@ -802,46 +851,126 @@ function drawLineArtFinal(ctx, art) {
   resetCtx(ctx);
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  if (art.inkCanvas) {
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(art.inkCanvas, 0, 0, ctx.canvas.width, ctx.canvas.height);
+  }
+  // Pen strokes: all of them without the ink picture (older pipeline), or
+  // just the precise face-feature outlines on top of it.
   setStrokeTransform(ctx, art.scale);
+  ctx.globalCompositeOperation = art.inkCanvas ? 'lighter' : 'source-over';
   for (const s of art.strokes) {
+    if (art.inkCanvas && !s.feature) continue;
     styleLineArtStroke(ctx, s, art.scale);
     ctx.beginPath();
     drawSmoothPath(ctx, s.segs);
     ctx.stroke();
   }
+  ctx.globalCompositeOperation = 'source-over';
   resetCtx(ctx);
 }
 
 /**
  * Live version: returns drawAt(progress) where progress goes 0 → 1.
  * The pen moves at a constant speed along the total length of all strokes.
+ * With the ink picture, the pen finishes at 88% of the time and the last
+ * 12% cross-fades into the finished, full-detail ink.
  */
 function createLineArtDrawer(ctx, art) {
   resetCtx(ctx);
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
   const pen = createStrokePen(art.strokes, (c, s) => styleLineArtStroke(c, s, art.scale));
+  const penShare = art.inkCanvas ? 0.88 : 1;
+  let sketch = null; // snapshot of the finished pen sketch, for the cross-fade
   return (progress) => {
-    setStrokeTransform(ctx, art.scale);
-    pen.advanceTo(ctx, progress * pen.totalLength);
+    if (progress <= penShare || !art.inkCanvas) {
+      setStrokeTransform(ctx, art.scale);
+      pen.advanceTo(ctx, Math.min(1, progress / penShare) * pen.totalLength);
+      resetCtx(ctx);
+      return;
+    }
+    if (!sketch) {
+      setStrokeTransform(ctx, art.scale);
+      pen.advanceTo(ctx, Infinity);
+      resetCtx(ctx);
+      sketch = makeCanvas(ctx.canvas.width, ctx.canvas.height);
+      sketch.getContext('2d').drawImage(ctx.canvas, 0, 0);
+    }
+    const q = clamp((progress - penShare) / (1 - penShare), 0, 1);
     resetCtx(ctx);
+    ctx.drawImage(sketch, 0, 0);
+    ctx.globalAlpha = q;
+    const finalCanvas = art.finalCanvas || (art.finalCanvas = (() => {
+      const c = makeCanvas(ctx.canvas.width, ctx.canvas.height);
+      drawLineArtFinal(c.getContext('2d'), art);
+      return c;
+    })());
+    ctx.drawImage(finalCanvas, 0, 0);
+    ctx.globalAlpha = 1;
   };
 }
 
 /** Build the Line art result from an <img>. */
 async function buildLineArt(image, detail, onStatus = () => {}) {
   const { width: w, height: h, data } = downscaleImage(image, SETTINGS.maxSideLineArt);
-  // The slider is shifted a little toward "more detail": 50 on the slider traces like 65.
-  const effectiveDetail = Math.min(100, 35 + detail * 0.6);
-  const gain = Math.max(1, w / (image.naturalWidth || image.width)); // how much a small photo was enlarged
+  const d = clamp(detail, 1, 100) / 100;
   const sizeFactor = Math.max(w, h) / 800;
-  // Trace a texture-free copy (edges kept, fabric/carpet/skin texture
-  // smoothed away), then drop leftover texture scribbles. This is what keeps
-  // busy photos clean. lowRatio 0.35: hysteresis follows fainter edges along
-  // real contours, so lines continue further.
-  const smooth = textureFree(data, w, h, Math.max(2, Math.round(Math.max(w, h) / 450)));
-  let raw = extractRawStrokes(smooth, w, h, { detail: effectiveDetail, strictness: 1, minPoints: Math.round(8 * sizeFactor), gain, lowRatio: 0.35 });
-  raw = suppressTexture(raw, w, h);
+  const scale = Math.max(w, h) / 1000;
+
+  // How the lines are found (the same ink method as the Illustration mode,
+  // section 4c, which captures far more real detail than edge tracing):
+  // 1. Edge-aware smoothing (domain transform) removes noise and fine
+  //    texture but keeps every real edge, including thin ones like hair
+  //    strands and lashes. Color edges count too (the guide includes color).
+  // 2. XDoG ink finds lines: bold on strong edges, lighter on soft ones.
+  // 3. Specks are removed, lines are thinned to 1-pixel center lines, and
+  //    those are traced into pen strokes (steps 7–9 of the shared pipeline).
+  onStatus('Finding the lines…');
+  await nextFrame();
+  // Dark photos: brighten a copy for line finding only, so faint edges in
+  // near-black areas (dark clothes, hair at night) become visible.
+  let lineSource = data;
+  const avgLight = averageLightness(data);
+  if (avgLight < 0.38) {
+    lineSource = new Uint8ClampedArray(data);
+    const lut = makeLevelsLut(lineSource);
+    const strength = clamp((0.38 - avgLight) / 0.18, 0, 1);
+    for (let v = 0; v < 256; v++) lut[v] = v + (lut[v] - v) * strength;
+    applyLut(lineSource, lut);
+  }
+  const lab = rgbaToLab(lineSource);
+  const guide = [new Float32Array(lab.L), lab.A, lab.B];
+  domainTransformSmooth([lab.L], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
+  const flow = edgeTangentFlow(lab.L, w, h, 3 * scale);
+  // tau = 1 ("pure" difference of Gaussians): only real edges become lines.
+  // (The Illustration uses tau < 1, which also inks very dark areas: good
+  // shading for a painting, but it would flood dark clothes in a line drawing.)
+  const ink = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -1.3 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+  removeInkSpecks(ink, w, h, Math.round(8 * scale * scale));
+  // Grow the ink by 1 pixel before thinning ("dilation"): it bridges tiny
+  // 1–2 px gaps, so a hair strand that the ink broke into dashes becomes one
+  // continuous line again.
+  const inkBin = new Uint8Array(w * h);
+  for (let i = 0; i < inkBin.length; i++) inkBin[i] = ink[i] < 0.5 ? 1 : 0;
+  const bin = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      bin[i] = inkBin[i] | inkBin[i - 1] | inkBin[i + 1] | inkBin[i - w] | inkBin[i + w] |
+        inkBin[i - w - 1] | inkBin[i - w + 1] | inkBin[i + w - 1] | inkBin[i + w + 1];
+    }
+  }
+  thinLines(bin, w, h);
+  let raw = filterAndSimplify(traceContours(bin, w, h), Math.max(4, Math.round(3.5 * sizeFactor)), SETTINGS.rdpEpsilon);
+  raw = suppressTexture(raw, w, h, { maxDensity: 0.15 }); // looser than before, so more detail survives
+  // How strong each line is (how dark its ink was), for line weight later.
+  const inkDark = blurTimes(Float32Array.from(ink, (v) => 1 - v), w, h, 1);
+  for (const s of raw) {
+    let sum = 0;
+    for (const p of s.points) sum += inkDark[clamp(Math.round(p.y), 0, h - 1) * w + clamp(Math.round(p.x), 0, w - 1)];
+    s.strength = sum / s.points.length;
+  }
 
   // Faces deserve extra care: find them, re-trace each one from a zoomed-in
   // crop, then add precise feature outlines from the face landmarks.
@@ -860,19 +989,25 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
     console.warn('Face finder unavailable, drawing without the face pass:', err);
   }
   if (faces.length) {
+    // The ink already captures the face's detail at full size; the landmarks
+    // add clean, complete outlines of the eyes, irises, brows, nose and lips.
     onStatus('Sketching facial features…');
-    raw = addFaceDetailLines(raw, w, h, image, faces, effectiveDetail);
     raw = addLandmarkFeatureLines(raw, landmarkFaces);
   }
 
   const strokes = finalizeStrokes(raw);
-  // Line weight is based on stroke length; measure it relative to an 800px
-  // image (sizeFactor) so weights look the same at any processing size.
+  // Line weight: half from how dark the ink was, half from the stroke's
+  // length (relative to an 800px image, so weights look the same at any size).
+  // Bold major contours, fine detail lines.
   for (const s of strokes) {
     s.color = sampleStrokeColor(s, data, w, h);
-    s.prominence = s.feature ? 0.7 : Math.sqrt(Math.min(1, s.rawLength / (240 * sizeFactor)));
+    const lengthPart = Math.sqrt(Math.min(1, s.rawLength / (240 * sizeFactor)));
+    s.prominence = s.feature ? 0.7 : clamp(0.5 * lengthPart + 0.6 * (s.strength ?? 0.5), 0, 1);
   }
   const totalLength = strokes.reduce((sum, s) => sum + s.length, 0);
+  onStatus('Adding the glow…');
+  await nextFrame();
+  const inkCanvas = renderGlowInk(ink, data, w, h);
 
   return {
     mode: 'lineart',
@@ -880,6 +1015,7 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
     height: h,
     scale: outputScale(w, h),
     strokes,
+    inkCanvas,
     isEmpty: strokes.length === 0 || totalLength < 40,
     faceCount: faces.length,
     note: strokes.length < 15 ? 'Only a few lines were found. Try raising "Edge detail".' : '',
@@ -3039,13 +3175,84 @@ function softQuantize(L, levels, sharpness, mix) {
  * ones, and flat regions stay clean. That's what makes it look drawn instead
  * of traced. Returns 0 (full ink) … 1 (no ink) per pixel.
  */
-function xdogLines(L, w, h, sigma, { tau = 0.98, eps = -0.6, phi = 1.3, k = 1.6 } = {}) {
+function xdogLines(L, w, h, sigma, { tau = 0.98, eps = -0.6, phi = 1.3, k = 1.6, flow = null } = {}) {
   const g1 = gaussianBlurSigma(L, w, h, sigma);
   const g2 = gaussianBlurSigma(L, w, h, sigma * k);
+  let dog = new Float32Array(w * h);
+  for (let i = 0; i < dog.length; i++) dog[i] = g1[i] - tau * g2[i];
+  // Flow-based version: smooth the DoG signal ALONG the direction the lines
+  // run, so on-and-off detections (a faint hair strand) join into one line.
+  if (flow) dog = flowSmooth(dog, flow.tx, flow.ty, w, h, flow.length);
   const out = new Float32Array(w * h);
   for (let i = 0; i < out.length; i++) {
-    const d = g1[i] - tau * g2[i];
+    const d = dog[i];
     out[i] = d >= eps ? 1 : Math.max(0, 1 + Math.tanh(phi * (d - eps)));
+  }
+  return out;
+}
+
+/**
+ * Edge tangent flow: the direction lines "run" at every pixel (along an
+ * edge, not across it), from the smoothed structure tensor.
+ * The gradient (gx, gy) points across an edge. Averaging the tensor
+ * [gx² gx·gy; gx·gy gy²] over a neighborhood (instead of averaging the raw
+ * gradients, which cancel out on thin lines where the two sides point in
+ * opposite directions) gives a stable direction even along hair strands.
+ * Its main eigenvector is the average "across" direction; turning it 90°
+ * gives the "along" direction. Returns unit vectors (tx, ty) per pixel.
+ */
+function edgeTangentFlow(L, w, h, sigma) {
+  const { magnitude, direction } = sobelEdges(L, w, h);
+  const n = w * h;
+  let E = new Float32Array(n), F = new Float32Array(n), G = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const gx = magnitude[i] * Math.cos(direction[i]), gy = magnitude[i] * Math.sin(direction[i]);
+    E[i] = gx * gx; F[i] = gx * gy; G[i] = gy * gy;
+  }
+  E = gaussianBlurSigma(E, w, h, sigma); F = gaussianBlurSigma(F, w, h, sigma); G = gaussianBlurSigma(G, w, h, sigma);
+  const tx = new Float32Array(n), ty = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const lambda = (E[i] + G[i] + Math.sqrt((E[i] - G[i]) ** 2 + 4 * F[i] * F[i])) / 2; // larger eigenvalue
+    let vx = F[i], vy = lambda - E[i];                                                 // its eigenvector (across)
+    if (Math.abs(vx) + Math.abs(vy) < 1e-9) { vx = lambda - G[i]; vy = F[i]; }
+    const len = Math.hypot(vx, vy);
+    if (len < 1e-9) { tx[i] = 1; ty[i] = 0; continue; }
+    tx[i] = -vy / len; ty[i] = vx / len;                                              // rotate 90° → along
+  }
+  return { tx, ty };
+}
+
+/**
+ * Smooth a signal along the flow field: from each pixel, take small steps
+ * forward and backward along the tangent direction (a "streamline", like
+ * following a current), and average the values met on the way with Gaussian
+ * weights. This is line integral convolution (LIC).
+ */
+function flowSmooth(src, tx, ty, w, h, length) {
+  const out = new Float32Array(w * h);
+  const steps = Math.max(2, Math.round(length));
+  const sigma = steps / 2;
+  const wts = [];
+  for (let k = 0; k <= steps; k++) wts.push(Math.exp(-(k * k) / (2 * sigma * sigma)));
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i0 = y * w + x;
+      let sum = src[i0] * wts[0], wsum = wts[0];
+      for (const dir of [1, -1]) {
+        let px = x, py = y, vx = tx[i0] * dir, vy = ty[i0] * dir;
+        for (let k = 1; k <= steps; k++) {
+          px += vx; py += vy;
+          const ix = Math.round(px), iy = Math.round(py);
+          if (ix < 0 || iy < 0 || ix >= w || iy >= h) break;
+          const j = iy * w + ix;
+          let nx = tx[j], ny = ty[j];
+          if (nx * vx + ny * vy < 0) { nx = -nx; ny = -ny; } // keep walking the same way
+          vx = nx; vy = ny;
+          sum += src[j] * wts[k]; wsum += wts[k];
+        }
+      }
+      out[i0] = sum / wsum;
+    }
   }
   return out;
 }
@@ -3277,12 +3484,17 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   const n = w * h;
   const scale = Math.max(w, h) / 1000; // sizes below are tuned for a 1000px image
 
-  // Dim photos get a gentle lift (60% of full auto-levels), so the
-  // illustration is well lit without washing out colors.
+  // Only genuinely dark photos get a lift (up to 60% of full auto-levels).
+  // Brightening normally lit photos washed the colors out; bold
+  // illustrations keep their deep darks.
   const photo = new Uint8ClampedArray(data);
-  const lut = makeLevelsLut(photo);
-  for (let v = 0; v < 256; v++) lut[v] = v + (lut[v] - v) * 0.6;
-  applyLut(photo, lut);
+  const avgLight = averageLightness(photo);
+  const lift = clamp((0.38 - avgLight) / 0.18, 0, 1) * 0.6;
+  if (lift > 0) {
+    const lut = makeLevelsLut(photo);
+    for (let v = 0; v < 256; v++) lut[v] = v + (lut[v] - v) * lift;
+    applyLut(photo, lut);
+  }
   const photoCanvas = makeCanvas(w, h);
   photoCanvas.getContext('2d').putImageData(new ImageData(photo, w, h), 0, 0);
 
@@ -3359,9 +3571,29 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
       }
     }
   }
+  // Bold color with "vibrance": muted colors get the biggest boost (a
+  // grayish navy couch becomes navy, a gray-brown wall becomes warm brown),
+  // already-vivid colors a smaller one, and true neutrals (white, gray,
+  // black; chroma under ~3) are left alone so they don't pick up a tint.
+  // Skin is boosted less so it stays natural instead of turning orange.
   for (let i = 0; i < n; i++) {
-    const k = skin ? 1.2 - 0.12 * clamp(skin[i], 0, 1) : 1.18; // skin a little less, so it doesn't turn orange
+    const chroma = Math.hypot(A[i], B[i]);
+    if (chroma < 1.5) continue;
+    const neutralGuard = clamp((chroma - 1.5) / 3, 0, 1);
+    let k = 1.3 + 0.55 * Math.exp(-chroma / 16);
+    if (skin) k -= (k - 1.15) * clamp(skin[i], 0, 1);
+    k = 1 + (k - 1) * neutralGuard;
     A[i] *= k; B[i] *= k;
+  }
+  // A warm illustration grade: nudge the midtones toward warm (a little more
+  // yellow/red), the golden light digital illustrations often have. Skin
+  // gets less (it's warm already); deep shadows and highlights are untouched.
+  for (let i = 0; i < n; i++) {
+    const mid = clamp(1 - Math.abs(L[i] - 55) / 40, 0, 1);
+    if (mid <= 0) continue;
+    const wgt = mid * (skin ? 1 - 0.6 * clamp(skin[i], 0, 1) : 1);
+    B[i] += 4 * wgt;
+    A[i] += 1.2 * wgt;
   }
 
   // Ink lines, traced from the smoothed lightness BEFORE sharpening (so hair
@@ -3369,7 +3601,8 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   // softened (no wrinkle/pore lines); the Edge detail slider sets how many.
   onStatus('Inking…');
   await nextFrame();
-  const ink = xdogLines(L, w, h, 1.0 * scale, { eps: -0.8 + (clamp(detail, 1, 100) / 100) * 0.9, phi: 1.9 });
+  const flow = edgeTangentFlow(L, w, h, 3 * scale);
+  const ink = xdogLines(L, w, h, 1.0 * scale, { eps: -0.6 + (clamp(detail, 1, 100) / 100) * 0.9, phi: 1.9, flow: { ...flow, length: 10 * scale } });
   removeInkSpecks(ink, w, h, Math.round(16 * scale * scale));
   if (skinInner) {
     for (let i = 0; i < n; i++) ink[i] = 1 - (1 - ink[i]) * (1 - 0.85 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1));
@@ -3391,6 +3624,14 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   for (let i = 0; i < n; i++) mix[i] = person ? 0.45 + 0.35 * (1 - clamp(person[i], 0, 1)) : 0.55;
   softQuantize(L, 12, 2.2, mix);
 
+  // Bolder light and shadow: an S-curve on lightness (done in Lab, so it
+  // adds contrast without shifting colors), with slightly deeper darks.
+  for (let i = 0; i < n; i++) {
+    const x = clamp(L[i] / 100, 0, 1);
+    const s = x - (0.42 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI);
+    L[i] = 100 * Math.pow(s, 1.07);
+  }
+
   onStatus('Coloring…');
   await nextFrame();
   const painted = labToRgba(L, A, B, new Uint8ClampedArray(n * 4));
@@ -3411,12 +3652,12 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     // A gentle S-curve: y = x − a·sin(2πx)/2π is steeper in the midtones
     // (more punch) and flatter at the ends (no crushed blacks or blown whites).
     const x = v / 255;
-    contrast[v] = 255 * (x - (0.3 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI));
+    contrast[v] = 255 * (x - (0.15 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI));
   }
   for (let i = 0, j = 0; i < n; i++, j += 4) {
     let e = ink[i];
-    if (outline) e = Math.min(e, 1 - outline[i]);
-    const t = e + (1 - e) * 0.14; // ink never goes below 14% of the color: dark, but colored, lines
+    if (outline) e = Math.min(e, 1 - outline[i] * 1.2);
+    const t = e + (1 - e) * 0.1; // ink never goes below 10% of the color: bold, but colored, lines
     painted[j] = contrast[(painted[j] * t) | 0];
     painted[j + 1] = contrast[(painted[j + 1] * t) | 0];
     painted[j + 2] = contrast[(painted[j + 2] * t) | 0];

@@ -16,13 +16,19 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 1. **Lab color**, to treat lightness and color separately.
 2. **Edge-aware smoothing** with the *domain transform* filter. It turns skin, fabric and walls into clean surfaces while every real edge stays sharp. It's region-aware via MediaPipe segmentation: skin is smoothest, hair and clothes keep detail, and the background is more painterly.
 3. **Even skin tone:** camera-flash glare is compressed and pulled back to the skin's real mid-tone color.
-4. **Soft shading bands**, a gently stepped version of the photo's lighting.
-5. **XDoG ink lines** (eXtended Difference of Gaussians): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
-6. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips.
+4. **Bold color:** a "vibrance" boost (muted colors are strengthened most, true neutrals are left alone), an S-curve for deeper contrast, and a gentle warm grade. Normally lit photos are no longer brightened, so darks stay rich.
+5. **Soft shading bands**, a gently stepped version of the photo's lighting.
+6. **Flow-based XDoG ink lines** (eXtended Difference of Gaussians, smoothed along the edge flow): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
+7. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips.
 
 In live mode, the pen inks the line art first, then the colors wash in underneath. Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
-**Line art** uses classic computer vision, written from scratch: Sobel edges → non-maximum suppression → Canny-style hysteresis → contour tracing → smoothing → RDP simplification → smooth curves. It works at 1400px for fine lines and lots of detail. A **face landmark model** finds faces: each one (with its hair) is re-traced from a zoomed-in crop, and the exact outlines of the eyes, irises, eyebrows, nose, lips and jaw are added from the landmarks.
+**Line art** draws glowing, detailed lines with the *flow-based XDoG* method (after Kang et al., "Coherent Line Drawing", and Winnemöller et al.):
+1. Edge-aware smoothing (domain transform) removes noise but keeps fine edges.
+2. An *edge tangent flow* field measures which way lines run at every pixel.
+3. The Difference-of-Gaussians ink signal is smoothed *along* that flow, so faint, broken detections (hair strands, fabric folds) join into long, flowing lines.
+
+The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, brows, nose and lips. Dark photos are brightened for line finding only.
 
 **Cartoon** doesn't filter the photo. It **draws** a cartoon of it, the way an illustrator works from a reference photo:
 
