@@ -1,6 +1,6 @@
 # Photo → Drawing
 
-Turn any photo into **glowing line art**, a **flat, bold-outlined cartoon**, or a **detailed digital illustration**, and watch it get drawn live. You can save the result as an image or a video, or share it straight from your phone.
+Turn any photo into **glowing line art**, a **pencil-sketched cartoon that's colored in**, or a **detailed digital illustration**, and watch it get drawn live. You can save the result as an image or a video, or share it straight from your phone.
 
 Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no build step. The one runtime dependency is Google's MediaPipe Tasks Vision library, which is loaded from a CDN only when it's needed.
 
@@ -10,7 +10,7 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 
 ## How the three styles work
 
-**Works on all kinds of photos.** Both styles trace lines from a *texture-free* copy of the photo (the Kuwahara filter smooths away fabric patterns, carpet, skin pores and noise but keeps real edges), then drop "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Colors like skin and hair are sampled from the mid-tones, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
+**Works on all kinds of photos.** Every style first smooths the photo with an *edge-aware* filter, which flattens fabric patterns, carpet, skin pores and noise but keeps real edges. It then finds lines that follow the shapes' flow, and drops "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Skin is evened out toward its real mid-tone color, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
 
 **Illustration** keeps the photo's real shapes, lighting and detail (so it keeps the person's likeness and works on any picture) and re-renders it as a clean digital illustration, following the classic "image abstraction" recipe from computer-graphics research:
 1. **Lab color**, to treat lightness and color separately.
@@ -27,25 +27,18 @@ In live mode, the pen inks the line art first, then the colors wash in underneat
 1. Edge-aware smoothing (domain transform) removes noise but keeps fine edges.
 2. An *edge tangent flow* field measures which way lines run at every pixel.
 3. The Difference-of-Gaussians ink signal is smoothed *along* that flow, so faint, broken detections (hair strands, fabric folds) join into long, flowing lines.
+4. This runs at two sizes: one for the main contours and a finer one that adds small details (strands of hair, lashes, creases, textures), merged into one drawing.
 
 The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, brows, nose and lips. Dark photos are brightened for line finding only.
 
-**Cartoon** doesn't filter the photo. It **draws** a cartoon of it, the way an illustrator works from a reference photo:
+**Cartoon** is a **pencil sketch of your photo, colored in**, the way a cartoonist sketches from a reference photo and then colors the sketch. It runs on the same engine as Illustration with a different recipe (a "preset"):
 
-1. **Body parts:** MediaPipe's *multiclass selfie segmenter*, a small neural network, labels every pixel as background, hair, face skin, body skin, clothes or accessories. The labels are smoothed into clean, drawable shapes.
-2. **Face landmarks:** MediaPipe's *face landmarker* finds 478 points on each face: the outlines of the eyes, irises, eyebrows, lips, nose and jaw.
-3. **Flat colors:** each region gets one flat color taken from the photo (the real skin tone, hair and clothing colors), plus simple cel shading. The shading includes a side shadow on the face, a shadow under the hairline and chin, and soft fabric folds. Hair gets three tones (shadow clumps, base, shine) plus fine strand lines traced from the photo's curls. Small high-contrast details like logos and zips keep their own color.
-4. **Drawn face:** everything is drawn as vector shapes exactly where the landmarks are:
-   - cartoon eyes (whites, iris with a ring, pupil, sparkles, lid shadow, bold upper lid and an eyelid crease), and solid eyebrows;
-   - the nose: its bridge shadow, nostrils and tip;
-   - two-tone lips with a shine (an open smile gets teeth), smile lines, and blush.
+1. **Pencil lines that follow the photo as it is:** flow-based XDoG at two sizes finds the main contours and the fine detail (hair strands, folds, fingers, facial features), and tiny specks are removed. The lines are drawn in graphite gray with a real *pencil texture*: random noise smeared along the edge flow (line integral convolution), so every line looks like it's made of small parallel pencil strokes. Dark areas get light pencil shading, and paper grain shows through.
+2. **Colored in:** stronger edge-aware smoothing flattens each area into a clean fill, and the lightness is gathered into a few clear shading tones (cel shading), so it looks like marker or colored-pencil coloring rather than a painting. The colors come from the photo: the real skin tone (with flash glare evened out), hair, clothes and background, with a vibrance boost. Midtones are lifted a little, like color on white paper, while deep darks such as black hair stay dark.
+3. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
+4. **Face refinement** from the 478 face landmarks: clean eyes with an iris ring and catchlight, lash lines, brows and lips.
 
-   Squinting eyes become happy closed-eye curves.
-5. **Ink:** bold outlines are traced along every border between regions, using the same contour pipeline as Line art. Thinner lines follow real seams, zips and pockets in the clothes.
-6. **Background:** flattened into simple color shapes (Kuwahara + k-means + a majority filter), with thin ink lines traced from the photo's real edges (buildings, windows, railings). The *Edge detail* slider sets how many. Everything stays crisp and hard-edged (no blur or glow, which would make it look painted). Night photos get a cartoon starry sky with flat, simple clouds and a blue night tint.
-7. **Fallback:** if the cartoon tools can't load (offline, very old browser), it uses a simpler classic filter painting and says so.
-
-It works best on photos with **1–3 people, faces visible and roughly facing the camera**. Closer photos give bigger, more detailed faces. With no person in the photo, it cartoonizes the scene only.
+In live mode, the pencil sketches the whole drawing on blank paper first, then the colors wash in. The *Edge detail* slider controls how many pencil lines appear and how flat the colors get. It works on any photo. With people in it, the face and body tools make skin, hair and clothes look their best, and with no person it sketches and colors the scene.
 
 | Library / model | Size | Source | License |
 | --- | --- | --- | --- |
@@ -55,7 +48,7 @@ It works best on photos with **1–3 people, faces visible and roughly facing th
 
 The files download the first time you use a style that needs them, then they're kept in the browser's cache. After that it starts quickly, even offline.
 
-**Speed:** Cartoon takes roughly 5–20 s depending on the device, and a progress message shows each step. Line art takes a few seconds.
+**Speed:** Cartoon and Illustration take roughly 5–20 s depending on the device, and a progress message shows each step. Line art is a little quicker. The first run also downloads the models.
 
 ### Music while it draws
 
@@ -79,18 +72,18 @@ When **Show it drawn out live** is on, a **Music** menu appears. The song starts
 The sections in `app.js` are:
 
 0. Settings & helpers
-1. **Shared pipeline**: downscale, grayscale, contrast stretch, Gaussian blur, Sobel, non-max suppression, hysteresis threshold, contour tracing, smoothing, RDP simplification, stroke ordering, smooth curves
-2. **Mode 1: Line art**
-3. **Painted fallback + shared painting helpers**: Kuwahara, k-means++, color grading, paper grain, reveal animation, sky detection, painted skies, light glow
-4. Web Worker helper
-4b. **Mode 2: Cartoon**: loading MediaPipe, segmentation, face landmarks, flat coloring and cel shading, drawing the face, inking the outlines, cartoon background
-4c. **Mode 3: Illustration**: Lab color, domain-transform smoothing, skin-tone evening, soft quantization, XDoG ink, speck removal, Zhang–Suen thinning (for the live pen), face refinement
+1. **Shared pipeline**: downscale, grayscale, contrast stretch, Gaussian blur, Sobel, non-max suppression, hysteresis threshold, contour tracing, smoothing, RDP simplification, stroke ordering, smooth curves (every style's lines go through the tracing and curve steps to become pen strokes)
+2. **Mode 1: Line art**: two-size flow-based XDoG, glowing ink rendering, the live pen
+3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (k-means color regions + reveal order), the result object
+4. Web Worker helper (runs k-means off the main thread)
+4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
+4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, pencil texture (Cartoon) or ink (Illustration), speck removal, Zhang–Suen thinning (for the live pen), face refinement
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback
 7. UI wiring
 
-Sections 1–4b don't touch the page's DOM, so they can later be moved into their own files (for example `shared-pipeline.js`, `line-art.js`, `cartoon.js`, loaded with extra `<script defer>` tags before `app.js`).
+Sections 1–4c don't touch the page's DOM, so they can later be moved into their own files (for example `shared-pipeline.js`, `line-art.js`, `stylized.js`, loaded with extra `<script defer>` tags before `app.js`).
 
 > After changing `app.js` or `style.css`, bump the `?v=` number on their links in `index.html` so visitors' browsers load the new version instead of an old cached copy.
 

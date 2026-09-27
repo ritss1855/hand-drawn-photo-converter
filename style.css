@@ -165,12 +165,15 @@ body {
     linear-gradient(115deg, transparent 45%, #ffd55c 46%, transparent 48%),
     #000;
 }
-.swatch-storybook {
+/* Cartoon: a little figure colored in on paper, with graphite pencil outlines
+   (the dark ring at the edge of each shape) and light pencil hatching behind. */
+.swatch-cartoon {
   background:
-    radial-gradient(ellipse at 70% 115%, #6f9c5a 0 40%, transparent 41%),
-    radial-gradient(ellipse at 20% 120%, #4f7f4c 0 45%, transparent 46%),
-    radial-gradient(circle at 78% 30%, #fff1c9 0 9px, transparent 10px),
-    linear-gradient(#9fcff0, #d8ecf5 70%);
+    radial-gradient(circle at 50% 46%, #f4c7a1 0 12px, #3a363a 12px 13.5px, transparent 14px),
+    radial-gradient(ellipse at 50% 36%, #5a3d30 0 19px, #3a363a 19px 20.5px, transparent 21px),
+    radial-gradient(ellipse at 50% 125%, #e7766f 0 30px, #3a363a 30px 31.5px, transparent 32px),
+    repeating-linear-gradient(120deg, transparent 0 6px, rgba(58, 54, 58, 0.16) 6px 7px),
+    #f5eede;
 }
 
 .swatch-illustration {

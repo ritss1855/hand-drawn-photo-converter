@@ -9,24 +9,30 @@
 
    TABLE OF CONTENTS
      0. Settings & small helpers
-     1. SHARED PIPELINE      (used by both styles: resize → gray → contrast
-                               stretch → blur → Sobel → non-max suppression
-                               → hysteresis threshold → contours → smooth
-                               → simplify → curves → stroke ordering)
-     2. MODE 1: LINE ART     (vivid colors sampled from the photo, glow on black)
-     3. PAINTED FALLBACK     (Kuwahara → k-means palette → color grading
-                               → paper grain → soft outlines; used if the
-                               Cartoon tools can't load) + shared painting helpers
-     4. WEB WORKER HELPER    (runs the heavy filters off the main thread)
-     4b. MODE 2: CARTOON     (MediaPipe hair/skin/clothes segmentation + face
-                               landmarks → flat colors, drawn face, bold outlines)
+     1. SHARED PIPELINE      (resize → gray → contrast stretch → blur → Sobel
+                               → non-max suppression → hysteresis threshold
+                               → contours → smooth → simplify → curves
+                               → stroke ordering; the tracing + curve steps
+                               turn every style's lines into pen strokes)
+     2. MODE 1: LINE ART     (flowing XDoG lines, colored from the photo, glowing on black)
+     3. PAINTING HELPERS     (paper, the "sketch first, then color it in"
+                               live drawing, and the result object for
+                               Cartoon and Illustration)
+     4. WEB WORKER HELPER    (runs the heavy k-means step off the main thread)
+     4b. FACE & BODY FINDER  (MediaPipe person/hair/skin segmentation and the
+                               478 face landmarks, plus small geometry helpers)
+     4c. MODES 2 & 3: CARTOON AND ILLUSTRATION
+                             (one shared engine with two presets: edge-aware
+                               smoothing, bold color, shading bands, and
+                               pencil or ink lines)
      5. LIVE DRAWING         (requestAnimationFrame animation "pen")
      6. EXPORT & SHARING     (PNG, video recording, Web Share API)
+     6b. MUSIC               (built-in songs made with Web Audio, or your own)
      7. UI WIRING            (DOM events, view switching)
 
-   Sections 1–3 only work on numbers/arrays and canvases. They don't touch the
+   Sections 1–4c only work on numbers/arrays and canvases. They don't touch the
    page's buttons or layout, so they can later be moved to their own files
-   (for example shared-pipeline.js, line-art.js, storybook.js).
+   (for example shared-pipeline.js, line-art.js, stylized.js).
    ============================================================================= */
 
 
@@ -36,20 +42,14 @@
 
 const SETTINGS = {
   maxSideLineArt: 1400,     // processing size (longest side) for Line art: full output size, for fine detail
-  maxSideStorybook: 600,    // Storybook is heavier, so it works on a smaller image
-  cartoonSide: 1400,        // Cartoon mode works at full output size, so edges stay razor sharp (no upscaling blur)
-  illustrationSide: 1400,   // Illustration mode works at full output size too
+  illustrationSide: 1400,   // Cartoon and Illustration work at full output size too, so edges stay sharp
   maxUpscale: 2.5,          // small photos are enlarged (up to 2.5x) before processing, so lines come out finer
   outputLongSide: 1400,     // the result canvas is always about this big, whatever the processing size
   rdpEpsilon: 0.6,          // Ramer–Douglas–Peucker tolerance, in pixels (lower = keeps more detail)
   maxStrokes: 12000,        // safety cap so extremely busy photos stay fast
   baseDurationMs: 8000,     // live drawing takes about 8 seconds at 1x speed
   holdFinalFrameMs: 1000,   // video keeps the finished picture on screen for 1 second
-  kmeansK: 16,              // number of paint colors in Storybook mode
-  kmeansMaxIter: 20,        // k-means gives up after this many rounds
-  kuwaharaRadii: [3, 2],    // two Kuwahara passes: a medium one, then a gentle one (bigger = blockier)
-  outlineOpacity: 0.6,      // Storybook outlines are drawn semi-transparent
-  paperColor: [245, 238, 222],
+  paperColor: [245, 238, 222], // the blank paper shown before the colors are painted in
 };
 
 /** Keep a number inside [lo, hi]. */
@@ -131,7 +131,7 @@ function makeValueNoise(w, h, cell) {
 
 
 /* =============================================================================
-   1. SHARED PIPELINE  (used by both Line art and Storybook anime)
+   1. SHARED PIPELINE  (the stroke toolkit every style uses)
    -----------------------------------------------------------------------------
    Goal: turn a photo into a list of pen strokes. Each stroke is an ordered list
    of points that a "pen" can follow.
@@ -139,6 +139,12 @@ function makeValueNoise(w, h, cell) {
    photo → downscale → grayscale → blur → Sobel → non-max suppression
          → threshold → contour tracing → drop short / simplify → order strokes
          → smooth quadratic curve segments
+
+   extractStrokes() runs all of it in one call (a classic "Canny" edge
+   detector plus tracing). The three styles find their lines a more artistic
+   way, with XDoG (section 4c), but they still use the downscale, blur and
+   Sobel steps and then the tracing → simplify → order → curves steps here to
+   turn those lines into pen strokes for the live drawing.
    ============================================================================= */
 
 /**
@@ -340,7 +346,7 @@ function nonMaxSuppression(mag, dir, w, h) {
  * Real contours are continuous, so they get followed even where they fade;
  * isolated noise has no strong pixel to grow from and disappears. The result
  * is longer, unbroken lines with far fewer fragments.
- * `strictness` > 1 raises both cutoffs (Storybook wants cleaner outlines).
+ * `strictness` > 1 raises both cutoffs (for cleaner, calmer outlines).
  */
 function thresholdEdges(thin, w, h, detail, strictness = 1, gain = 1, lowRatio = 0.4) {
   const BINS = 2048; // Sobel magnitudes on 0–255 input stay below ~1450
@@ -575,16 +581,6 @@ function suppressTexture(strokes, w, h, { maxDensity = 0.09, longLen = 0 } = {})
     for (const p of s.points) d += density[clamp(p.y / cell | 0, 0, gh - 1) * gw + clamp(p.x / cell | 0, 0, gw - 1)];
     return d / s.points.length < maxDensity;
   });
-}
-
-/**
- * A copy of the image with texture smoothed away but edges kept (the
- * Kuwahara filter from section 3), used as the source for tracing lines.
- * Tracing this instead of the raw photo means fabric weave, skin pores,
- * carpet and noise don't become lines, while the outlines of real shapes do.
- */
-function textureFree(rgba, w, h, radius) {
-  return radius > 0 ? kuwaharaFilter(rgba, w, h, radius) : rgba;
 }
 
 /**
@@ -946,8 +942,14 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
   // tau = 1 ("pure" difference of Gaussians): only real edges become lines.
   // (The Illustration uses tau < 1, which also inks very dark areas: good
   // shading for a painting, but it would flood dark clothes in a line drawing.)
-  const ink = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -1.3 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
-  removeInkSpecks(ink, w, h, Math.round(8 * scale * scale));
+  const main = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -1.1 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+  // A second, finer layer (smaller blur, shorter flow) catches small details:
+  // lashes, creases, small folds and texture edges. It's drawn a bit lighter,
+  // so the main flowing lines still lead.
+  const fine = xdogLines(lab.L, w, h, 0.6 * scale, { tau: 1, eps: -1.0 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+  const ink = new Float32Array(w * h);
+  for (let i = 0; i < ink.length; i++) ink[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.75);
+  removeInkSpecks(ink, w, h, Math.round(6 * scale * scale));
   // Grow the ink by 1 pixel before thinning ("dilation"): it bridges tiny
   // 1–2 px gaps, so a hair strand that the ink broke into dashes becomes one
   // continuous line again.
@@ -1026,13 +1028,17 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
 
 
 /* =============================================================================
-   3. PAINTED FALLBACK + SHARED PAINTING HELPERS
-      (the classic filter "storybook" look, used when the Cartoon tools in
-      section 4b can't load; its reveal animation and sky/glow helpers are
-      shared with the Cartoon)
+   3. PAINTING HELPERS  (used by Cartoon and Illustration, section 4c)
    -----------------------------------------------------------------------------
-   Kuwahara (painterly smoothing) → k-means (limited paint palette) → color
-   grading (warm, soft, lifted) → soften + paper grain → thin brown outlines.
+   Section 4c makes the finished picture. This section turns it into a live
+   drawing, the way an artist works: the pen sketches the lines on blank
+   paper first, then the colors are washed in, region by region.
+     - k-means groups the finished picture's pixels into 12 color regions,
+       and computeRevealOrder() decides when each pixel gets its color.
+     - makePaperGrain() / composePaper(): the textured blank paper.
+     - makePaintedArt() packages everything into the result object.
+   (Kuwahara is the "oil paint" smoother. paintStage() can run it before
+   k-means; the current styles skip it because 4c already smooths the photo.)
 
    NOTE: kuwaharaFilter, kmeansPlusPlusInit, kmeansQuantize and paintStage are
    copied into a Web Worker as text (see section 4), so they must be fully
@@ -1218,31 +1224,14 @@ function kmeansQuantize(rgba, w, h, k, maxIter) {
 }
 
 /**
- * The heavy part of Storybook mode, grouped so it can run in a Web Worker:
- * Kuwahara passes, then k-means on the smoothed result.
+ * The heavy painting step, grouped so it can run in a Web Worker:
+ * optional Kuwahara passes (opts.radii), then k-means on the result.
  */
 function paintStage(rgba, w, h, opts) {
   let smoothed = rgba;
   for (let i = 0; i < opts.radii.length; i++) smoothed = kuwaharaFilter(smoothed, w, h, opts.radii[i]);
   const km = kmeansQuantize(smoothed, w, h, opts.k, opts.maxIter);
   return { smoothed, labels: km.labels, centers: km.centers };
-}
-
-/**
- * Auto levels + brightening (changes `rgba` in place).
- * Storybook films are bright and airy; a night or indoor photo would come out
- * muddy. Like "auto levels" in a photo editor:
- *   1. find the darkest and brightest 0.5% brightness levels and stretch that
- *      range to 0–255 (gain capped at 2.5x so noise isn't blown up);
- *   2. if the picture is still dark on average, apply a gamma curve (power
- *      < 1) that lifts the shadows and midtones until the average brightness
- *      is about 45%.
- * All three channels get the same curve, so colors keep their hue.
- * makeLevelsLut() computes the curve as a 256-entry look-up table so the SAME
- * curve can also be applied to a face close-up (keeping colors consistent).
- */
-function autoLevels(rgba) {
-  applyLut(rgba, makeLevelsLut(rgba));
 }
 
 /** Apply a 256-entry look-up table to the R, G and B of every pixel (in place). */
@@ -1252,6 +1241,17 @@ function applyLut(rgba, lut) {
   }
 }
 
+/**
+ * "Auto levels" curve for brightening dark photos, as a 256-entry look-up
+ * table (old value → new value). Like auto levels in a photo editor:
+ *   1. find the darkest and brightest 0.5% brightness levels and stretch that
+ *      range to 0–255 (gain capped at 2.5x so noise isn't blown up);
+ *   2. if the picture is still dark on average, apply a gamma curve (power
+ *      < 1) that lifts the shadows and midtones until the average brightness
+ *      is about 45%.
+ * All three channels get the same curve, so colors keep their hue. Callers
+ * can blend it with "no change" to lift only partway (see buildStylized).
+ */
 function makeLevelsLut(rgba) {
   const n = rgba.length / 4;
   const hist = new Uint32Array(256);
@@ -1277,28 +1277,6 @@ function makeLevelsLut(rgba) {
 }
 
 /**
- * Soft color grading, applied to each palette color and to the shading layer.
- *  - Lift shadows: nothing is pitch black, like light bouncing in a painting.
- *  - Gently boost saturation.
- *  - Sky: blue, fairly bright colors get lighter and slightly softer.
- *  - Warm midtones: add a touch of red/yellow where lightness is near 50%.
- */
-function gradeColor(r, g, b) {
-  let [hue, s, l] = rgbToHsl(r, g, b);
-  l = 0.08 + 0.92 * l;
-  s = Math.min(1, s * 1.2 + 0.04);
-  if (hue > 185 && hue < 250 && s > 0.12 && l > 0.35) {
-    l += (1 - l) * 0.3;
-    s *= 0.85;
-    hue -= 6; // nudge toward a clean cyan-blue
-  }
-  let [R, G, B] = hslToRgb(hue, s, l);
-  const mid = 1 - Math.abs(l - 0.5) * 2; // 1 at mid-gray, 0 at black/white
-  R += 10 * mid; G += 4 * mid; B -= 6 * mid;
-  return [clamp(R, 0, 255), clamp(G, 0, 255), clamp(B, 0, 255)];
-}
-
-/**
  * Paper grain: a per-pixel brightness multiplier around 1.0 (±6%), mixing
  * large soft blotches, medium fibers and fine random speckle.
  */
@@ -1311,47 +1289,6 @@ function makePaperGrain(w, h) {
     grain[i] = 1 + (v - 0.5) * 0.12;
   }
   return grain;
-}
-
-/** Light blur on each color channel, to soften the hard pixel steps between palette regions (like wet paint edges). */
-function softenColors(rgba, w, h) {
-  const n = w * h;
-  const out = new Uint8ClampedArray(rgba.length);
-  const channel = new Float32Array(n);
-  for (let c = 0; c < 3; c++) {
-    for (let i = 0; i < n; i++) channel[i] = rgba[i * 4 + c];
-    const blurred = gaussianBlur(channel, w, h);
-    for (let i = 0; i < n; i++) out[i * 4 + c] = blurred[i];
-  }
-  for (let i = 0; i < n; i++) out[i * 4 + 3] = 255;
-  return out;
-}
-
-/**
- * Final painted pixels: palette color per pixel, blended with a little of the
- * smoothed photo's own (graded) color → soften → paper grain.
- * Pure palette colors look like flat cut-paper, and a face can collapse into a
- * single blob. Mixing back ~35% of the smooth shading keeps the form (cheeks,
- * nose, folds in clothes) while the palette still gives the flat,
- * illustrated look. Painters work the same way: flat base washes plus soft
- * shading.
- */
-const SHADING_MIX = 0.35;
-function composePainting(labels, palette, smoothed, grain, w, h) {
-  const flat = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0, j = 0; i < labels.length; i++, j += 4) {
-    const c = palette[labels[i]];
-    const s = gradeColor(smoothed[j], smoothed[j + 1], smoothed[j + 2]);
-    flat[j] = c[0] + (s[0] - c[0]) * SHADING_MIX;
-    flat[j + 1] = c[1] + (s[1] - c[1]) * SHADING_MIX;
-    flat[j + 2] = c[2] + (s[2] - c[2]) * SHADING_MIX;
-    flat[j + 3] = 255;
-  }
-  const soft = softenColors(flat, w, h);
-  for (let i = 0, j = 0; i < grain.length; i++, j += 4) {
-    soft[j] *= grain[i]; soft[j + 1] *= grain[i]; soft[j + 2] *= grain[i];
-  }
-  return soft;
 }
 
 /** The blank textured paper shown before the paint arrives. */
@@ -1448,7 +1385,7 @@ function styleOutline(ctx, stroke) {
  * is blended at reduced opacity. (Drawing each line semi-transparent directly
  * would create darker dots wherever line pieces overlap.)
  */
-function compositeStorybook(ctx, paintSource, outlineLayer, opacity) {
+function compositePainted(ctx, paintSource, outlineLayer, opacity) {
   resetCtx(ctx);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
@@ -1458,9 +1395,9 @@ function compositeStorybook(ctx, paintSource, outlineLayer, opacity) {
   ctx.globalAlpha = 1;
 }
 
-function drawStorybookFinal(ctx, art) {
+function drawPaintedFinal(ctx, art) {
   if (art.linesBaked) {
-    // The Illustration already has its ink lines inside the painting.
+    // Cartoon and Illustration already have their lines inside the painting.
     resetCtx(ctx);
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(art.paintCanvas, 0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -1475,14 +1412,16 @@ function drawStorybookFinal(ctx, art) {
     drawSmoothPath(lctx, s.segs);
     lctx.stroke();
   }
-  compositeStorybook(ctx, art.paintCanvas, layer, art.outlineOpacity);
+  compositePainted(ctx, art.paintCanvas, layer, art.outlineOpacity);
 }
 
 /**
- * Live version: the first ~55% of the time spreads the paint washes, the rest
- * draws outlines stroke by stroke on top.
+ * Live version. With art.linesFirst (Cartoon and Illustration), the pen
+ * sketches the lines for the first 45% of the time and then the colors wash
+ * in. Otherwise the paint washes come first (~55%) and the outlines are drawn
+ * stroke by stroke on top.
  */
-function createStorybookDrawer(ctx, art) {
+function createPaintedDrawer(ctx, art) {
   const work = makeCanvas(art.width, art.height);
   const wctx = work.getContext('2d');
   const frame = wctx.createImageData(art.width, art.height);
@@ -1502,14 +1441,14 @@ function createStorybookDrawer(ctx, art) {
     return (progress) => {
       if (!penDone && progress < lineShare) {
         pen.advanceTo(lctx, (progress / lineShare) * pen.totalLength);
-        compositeStorybook(ctx, paper, layer, 1);
+        compositePainted(ctx, paper, layer, 1);
         return;
       }
       if (!penDone) { pen.advanceTo(lctx, Infinity); penDone = true; }
       const q = lineShare ? Math.min(1, (progress - lineShare) / (1 - lineShare)) : progress;
       renderPaintWash(frame, art.painted, art.paper, art.revealAt, q);
       wctx.putImageData(frame, 0, 0);
-      compositeStorybook(ctx, q >= 1 ? art.paintCanvas : work, layer, Math.max(0, 1 - q * 1.3));
+      compositePainted(ctx, q >= 1 ? art.paintCanvas : work, layer, Math.max(0, 1 - q * 1.3));
     };
   }
 
@@ -1526,63 +1465,23 @@ function createStorybookDrawer(ctx, art) {
     if (progress > paintShare) {
       pen.advanceTo(lctx, ((progress - paintShare) / (1 - paintShare)) * pen.totalLength);
     }
-    compositeStorybook(ctx, paintDone ? art.paintCanvas : work, layer, art.outlineOpacity);
+    compositePainted(ctx, paintDone ? art.paintCanvas : work, layer, art.outlineOpacity);
   };
 }
 
 /**
- * Mode 2 entry point: the Cartoon (section 4b), which draws the person as a
- * flat, bold-outlined cartoon using MediaPipe body-part segmentation and face
- * landmarks. If those can't load (offline, very old browser, download
- * blocked), fall back to the classic storybook filters so the button still works.
+ * Shared finishing steps for a painted result: paper, reveal plan, pen
+ * strokes and the result object that the UI draws.
  */
-async function buildCartoonOrFallback(image, detail, onStatus = () => {}) {
-  try {
-    return await buildCartoon(image, detail, onStatus);
-  } catch (err) {
-    console.warn('Cartoon tools unavailable, using the classic filters instead:', err);
-    onStatus('Painting…');
-    const art = await buildStorybookClassic(image, detail);
-    art.note = "The cartoon tools couldn't load (offline or unsupported browser), so this is a simpler painted version.";
-    return art;
-  }
-}
-
-/** Classic Storybook (no AI): Kuwahara → k-means palette → grading → grain. */
-async function buildStorybookClassic(image, detail) {
-  const { width: w, height: h, data } = downscaleImage(image, SETTINGS.maxSideStorybook);
-  autoLevels(data); // storybook scenes are bright and airy, even when the photo was taken at night
-
-  const { smoothed, labels, centers } = await runPaintStage(data, w, h, {
-    radii: SETTINGS.kuwaharaRadii,
-    k: SETTINGS.kmeansK,
-    maxIter: SETTINGS.kmeansMaxIter,
-  });
-  await nextFrame(); // let the spinner breathe between heavy steps
-
-  const palette = [];
-  for (let c = 0; c < centers.length / 3; c++) {
-    palette.push(gradeColor(centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]));
-  }
-  const grain = makePaperGrain(w, h);
-  const painted = composePainting(labels, palette, smoothed, grain, w, h);
-
-  // Outlines come from the smoothed image: cleaner lines that follow the painted shapes.
-  return makeStorybookArt({
-    w, h, painted, grain, labels, centers,
-    edgeSource: smoothed, detail, strictness: 1.4, minPoints: 12, outlineOpacity: SETTINGS.outlineOpacity,
-  });
-}
-
-/** Shared finishing steps for both Storybook versions: paper, reveal plan, outlines, result object. */
-function makeStorybookArt({ w, h, painted, grain, labels, centers, edgeSource, detail, strictness, minPoints, outlineOpacity, faces = 0, customStrokes = null }) {
+function makePaintedArt({ w, h, painted, grain, labels, centers, edgeSource, detail, strictness, minPoints, outlineOpacity, faces = 0, customStrokes = null }) {
   const palette = [];
   for (let c = 0; c < centers.length / 3; c++) palette.push([centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]]);
   const paper = composePaper(grain, w, h);
   const revealAt = computeRevealOrder(labels, palette, w, h);
   const scale = outputScale(w, h);
 
-  // Either strokes built by the caller (Cartoon), or soft outlines traced from `edgeSource`.
+  // Either strokes built by the caller (Cartoon / Illustration), or soft outlines
+  // traced from `edgeSource` with the classic pipeline from section 1.
   let strokes = customStrokes;
   if (!strokes) {
     strokes = extractStrokes(edgeSource, w, h, { detail, strictness, minPoints });
@@ -1593,7 +1492,7 @@ function makeStorybookArt({ w, h, painted, grain, labels, centers, edgeSource, d
   paintCanvas.getContext('2d').putImageData(new ImageData(painted, w, h), 0, 0);
 
   return {
-    mode: 'storybook',
+    mode: 'painted', // replaced by the caller's style name
     width: w,
     height: h,
     scale,
@@ -1606,8 +1505,8 @@ function makeStorybookArt({ w, h, painted, grain, labels, centers, edgeSource, d
     faceCount: faces,
     isEmpty: false, // there's always a painting, even with no outlines
     note: '',
-    drawFinal(ctx) { drawStorybookFinal(ctx, this); },
-    createLiveDrawer(ctx) { return createStorybookDrawer(ctx, this); },
+    drawFinal(ctx) { drawPaintedFinal(ctx, this); },
+    createLiveDrawer(ctx) { return createPaintedDrawer(ctx, this); },
   };
 }
 
@@ -1676,25 +1575,22 @@ function runPaintStage(rgba, w, h, opts) {
 
 
 /* =============================================================================
-   4b. CARTOON MODE  (MediaPipe body-part segmentation + face landmarks)
+   4b. FACE & BODY FINDER  (MediaPipe segmentation + face landmarks)
    -----------------------------------------------------------------------------
-   Instead of filtering the photo, this mode DRAWS a cartoon of it, the way an
-   illustrator works from a reference photo:
+   Two small neural networks from Google's MediaPipe tell the styles WHERE
+   things are, so each part of the picture can be treated the right way:
 
-     1. MediaPipe's "multiclass selfie" segmenter (a small neural network)
-        labels every pixel: background, hair, body skin, face skin, clothes
-        or accessories.
-     2. MediaPipe's face landmarker finds 478 points on each face: outlines of
-        the eyes, irises, eyebrows, lips, nose and jaw.
-     3. Every region gets ONE flat color taken from the photo, plus one
-        shadow tone ("cel shading"). Clothes get a few flat colors (so folds,
-        pockets and logos survive), and the background is flattened into big
-        simple shapes.
-     4. Cartoon eyes (whites, iris, pupil, sparkle), filled eyebrows, a small
-        nose, lips and blush are drawn as vector shapes exactly where the
-        landmarks are.
-     5. Bold outlines are traced along the borders between regions with the
-        same contour pipeline Line art uses.
+     1. The "multiclass selfie" segmenter labels every pixel: background,
+        hair, body skin, face skin, clothes or accessories. Cartoon and
+        Illustration use it to smooth skin more than hair, keep clothes
+        detailed, and outline the person.
+     2. The face landmarker finds 478 points on each face: outlines of the
+        eyes, irises, eyebrows, lips, nose and jaw. Line art uses them for
+        crisp feature lines; Cartoon and Illustration use them to refine the
+        eyes, brows and lips (refineFace in 4c).
+
+   Both are optional: if they can't load (offline, blocked, old browser),
+   every style still works, just without the extra face/body care.
 
    Both models are small (~20 MB together), run on your device with
    WebAssembly, and are cached after the first download. The photo itself
@@ -1833,107 +1729,11 @@ async function findFaceLandmarks(canvas) {
   return result.faceLandmarks.map((pts) => pts.map((p) => ({ x: p.x * canvas.width, y: p.y * canvas.height })));
 }
 
-/**
- * Face boxes in source-image pixels, biggest first (used by Line art's face
- * pass). Small photos are enlarged first: the detector finds small faces
- * more reliably when they're a bit bigger.
- */
-async function detectFaces(source) {
-  const srcW = source.naturalWidth || source.width, srcH = source.naturalHeight || source.height;
-  const scale = clamp(1024 / Math.max(srcW, srcH), 0.25, 3);
-  const c = makeCanvas(Math.round(srcW * scale), Math.round(srcH * scale));
-  const cctx = c.getContext('2d');
-  cctx.imageSmoothingQuality = 'high';
-  cctx.drawImage(source, 0, 0, c.width, c.height);
-  const faces = await findFaceLandmarks(c);
-  const minSide = Math.max(12, 0.02 * Math.max(srcW, srcH));
-  return faces
-    .map((pts) => {
-      const xs = pts.map((p) => p.x / scale), ys = pts.map((p) => p.y / scale);
-      return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
-    })
-    .filter((f) => f.x2 - f.x1 >= minSide && f.y2 - f.y1 >= minSide)
-    .sort((a, b) => (b.x2 - b.x1) * (b.y2 - b.y1) - (a.x2 - a.x1) * (a.y2 - a.y1))
-    .slice(0, 4);
-}
-
-/**
- * A square crop around a face box, grown by `grow` so it includes hair, ears
- * and chin, and nudged up by `lift` × face height. Kept inside the image.
- */
-function faceRegion(face, imgW, imgH, grow, lift) {
-  const fw = face.x2 - face.x1, fh = face.y2 - face.y1;
-  const size = Math.min(grow * Math.max(fw, fh), imgW, imgH);
-  const cx = (face.x1 + face.x2) / 2, cy = (face.y1 + face.y2) / 2 - lift * fh;
-  return {
-    x: clamp(cx - size / 2, 0, imgW - size),
-    y: clamp(cy - size / 2, 0, imgH - size),
-    size,
-  };
-}
-
-/** Resize RGBA pixels with the browser's high-quality scaler. */
-function resizeRGBA(rgba, w, h, nw, nh) {
-  const src = makeCanvas(w, h);
-  src.getContext('2d').putImageData(new ImageData(rgba, w, h), 0, 0);
-  const dst = makeCanvas(nw, nh);
-  const dctx = dst.getContext('2d', { willReadFrequently: true });
-  dctx.imageSmoothingQuality = 'high';
-  dctx.drawImage(src, 0, 0, nw, nh);
-  return dctx.getImageData(0, 0, nw, nh).data;
-}
-
 /** Fraction of a stroke's points that lie inside a circle. */
 function fractionInside(points, cx, cy, radius) {
   let inside = 0;
   for (const p of points) if ((p.x - cx) ** 2 + (p.y - cy) ** 2 <= radius * radius) inside++;
   return inside / points.length;
-}
-
-/**
- * Line-art face pass: re-trace each face from a zoomed-in crop.
- * In the full photo, eyes and lips are only a few pixels tall and their edges
- * are weak next to strong edges like a jacket against the sky, so the global
- * threshold drops them. Tracing a close-up of just the face gives two wins:
- * (1) features become big enough to trace smoothly, and (2) the edge
- * threshold adapts to the face's own contrast, so soft features survive.
- * Base strokes inside the face are then replaced by the detailed ones.
- */
-function addFaceDetailLines(raw, w, h, source, faces, detail) {
-  const srcW = source.naturalWidth || source.width, srcH = source.naturalHeight || source.height;
-  const k = w / srcW;
-  let result = raw;
-
-  for (const face of faces) {
-    const r = faceRegion(face, srcW, srcH, 1.9, 0.12); // wide enough to include the hair
-    const size = r.size * k;
-    // Close-up size: enlarge the face ~3x, but not more. Enlarging a tiny JPEG
-    // face too far turns skin texture and compression blocks into fake lines.
-    const C = Math.round(clamp(r.size * 3, 240, 600));
-    const cx = (r.x + r.size / 2) * k, cy = (r.y + r.size / 2) * k, radius = size / 2;
-
-    const crop = makeCanvas(C, C);
-    const cctx = crop.getContext('2d', { willReadFrequently: true });
-    cctx.imageSmoothingQuality = 'high';
-    cctx.drawImage(source, r.x, r.y, r.size, r.size, 0, 0, C, C);
-    // Smooth away skin texture first (Kuwahara), and trace a little stricter
-    // than the main pass with longer minimum strokes: we want clean eyes,
-    // brows, nose, lips and hair shapes, not every pore.
-    const data = textureFree(cctx.getImageData(0, 0, C, C).data, C, C, 2);
-    const faceStrokes = suppressTexture(
-      extractRawStrokes(data, C, C, { detail, strictness: 1.3, minPoints: 14 }), C, C, { maxDensity: 0.12 });
-    const f = size / C; // crop pixels → processing pixels
-    const mapped = [];
-    for (const s of faceStrokes) {
-      const points = s.points.map((p) => ({ x: r.x * k + p.x * f, y: r.y * k + p.y * f }));
-      if (fractionInside(points, cx, cy, radius * 0.92) < 0.7) continue; // stay inside the face circle
-      // Features are short, but they matter: give them a bit more line weight than their length alone would.
-      mapped.push({ points, rawLength: s.rawLength * f * 1.6 });
-    }
-
-    result = result.filter((s) => fractionInside(s.points, cx, cy, radius * 0.8) < 0.5).concat(mapped);
-  }
-  return result;
 }
 
 /**
@@ -1986,8 +1786,6 @@ function addLandmarkFeatureLines(raw, faces) {
 const pick = (pts, idx) => idx.map((i) => pts[i]);
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const lerpPt = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-const css = (c, a = 1) => `rgba(${c[0] | 0}, ${c[1] | 0}, ${c[2] | 0}, ${a})`;
-const mixColor = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 
 function centroid(points) {
   let x = 0, y = 0;
@@ -1998,16 +1796,6 @@ function centroid(points) {
 /** Stretch points away from (cx, cy) by sx horizontally and sy vertically. */
 function scaleAbout(points, cx, cy, sx, sy) {
   return points.map((p) => ({ x: cx + (p.x - cx) * sx, y: cy + (p.y - cy) * sy }));
-}
-
-/** Shoelace formula: the area inside a polygon. */
-function polygonArea(points) {
-  let a = 0;
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i], q = points[(i + 1) % points.length];
-    a += p.x * q.y - q.x * p.y;
-  }
-  return Math.abs(a) / 2;
 }
 
 /** A smooth closed curve through a ring of points (curves through midpoints, like buildSegments). */
@@ -2034,19 +1822,6 @@ function smoothOpenPath(ctx, pts) {
   ctx.lineTo(last.x, last.y);
 }
 
-/** Pixels inside a polygon, as a 0/1 mask (the browser's canvas does the filling). */
-function polygonMask(points, w, h) {
-  const c = makeCanvas(w, h);
-  const cctx = c.getContext('2d', { willReadFrequently: true });
-  cctx.beginPath();
-  smoothClosedPath(cctx, points);
-  cctx.fill();
-  const d = cctx.getImageData(0, 0, w, h).data;
-  const mask = new Uint8Array(w * h);
-  for (let i = 0; i < mask.length; i++) mask[i] = d[i * 4 + 3] > 127 ? 1 : 0;
-  return mask;
-}
-
 /** Blur a float mask several times (each pass is the 5-tap Gaussian from step 3). */
 function blurTimes(mask, w, h, passes) {
   let m = mask;
@@ -2054,930 +1829,11 @@ function blurTimes(mask, w, h, passes) {
   return m;
 }
 
-/** Median color of the pixels where labels === label (null if there are none). Medians ignore stray outliers. */
-function medianColor(rgba, labels, label) {
-  const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
-  let n = 0;
-  for (let i = 0; i < labels.length; i++) {
-    if (labels[i] !== label) continue;
-    hist[0][rgba[i * 4]]++; hist[1][rgba[i * 4 + 1]]++; hist[2][rgba[i * 4 + 2]]++;
-    n++;
-  }
-  if (n < 20) return null;
-  return hist.map((hst) => {
-    let acc = 0;
-    for (let v = 0; v < 256; v++) { acc += hst[v]; if (acc >= n / 2) return v; }
-    return 255;
-  });
-}
-
-/**
- * A robust "true color" of a region: the average of its pixels in a middle
- * brightness band (between the `lo` and `hi` brightness percentiles),
- * ignoring near-white glare and colorless pixels (below `minSat` saturation).
- * A plain median fails with camera flash or strong light: the lit parts of a
- * face can be almost white, which made darker skin tones come out far too
- * pale. The mid-tones hold the real color. For hair, a lower band ignores
- * the shine so black hair stays black.
- */
-function toneSample(rgba, labels, classes, lo = 0.25, hi = 0.5, minSat = 0) {
-  const px = [];
-  for (let i = 0; i < labels.length; i += 2) {
-    if (!classes.includes(labels[i])) continue;
-    const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-    if (mx > 248) continue;                                  // blown-out glare
-    if (minSat && (mx - mn) / Math.max(1, mx) < minSat) continue; // colorless (shine, gray)
-    px.push([0.299 * r + 0.587 * g + 0.114 * b, r, g, b]);
-  }
-  if (px.length < 30) return null;
-  px.sort((a, b) => a[0] - b[0]);
-  const a = Math.floor(px.length * lo), z = Math.max(a + 1, Math.floor(px.length * hi));
-  let r = 0, g = 0, b = 0;
-  for (let k = a; k < z; k++) { r += px[k][1]; g += px[k][2]; b += px[k][3]; }
-  const n = z - a;
-  return [r / n, g / n, b / n];
-}
-
-/**
- * Majority ("mode") filter: each pixel takes the most common label in its
- * (2r+1)×(2r+1) neighborhood. It erases specks and smooths jagged borders
- * between flat color regions, which is key to the clean "vector" look.
- * Pixels labelled `ignore` are skipped and never counted.
- */
-function majorityFilter(labels, w, h, k, r, ignore = 255) {
-  const out = new Uint8Array(labels);
-  const counts = new Uint16Array(k);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (labels[i] === ignore) continue;
-      counts.fill(0);
-      for (let dy = -r; dy <= r; dy++) {
-        const yy = y + dy;
-        if (yy < 0 || yy >= h) continue;
-        for (let dx = -r; dx <= r; dx++) {
-          const xx = x + dx;
-          if (xx < 0 || xx >= w) continue;
-          const l = labels[yy * w + xx];
-          if (l !== ignore) counts[l]++;
-        }
-      }
-      let best = labels[i], bestN = 0;
-      for (let c = 0; c < k; c++) if (counts[c] > bestN) { bestN = counts[c]; best = c; }
-      out[i] = best;
-    }
-  }
-  return out;
-}
-
-/* ---------- Cartoon color styling ---------- */
-
-const hsl = (h, s, l) => hslToRgb(h, clamp(s, 0, 1), clamp(l, 0, 1));
-
-/** Skin: keep the person's real skin tone, but clean and a little brighter, plus a shadow, blush and line tone. */
-function styleSkin(c) {
-  const [h, s0, l0] = rgbToHsl(c[0], c[1], c[2]);
-  // Only a small cleanup: a touch more color and brightness. Big boosts wash out darker skin tones.
-  const s = clamp(s0 * 1.08, 0.18, 0.62), l = clamp(l0 + 0.03, 0.18, 0.86);
-  return {
-    base: hsl(h, s, l),
-    shadow: hsl(h - 3, s + 0.02, l - 0.08),
-    line: hsl(h - 8, s + 0.12, l * 0.5),
-    blush: mixColor(hsl(h, s, l), [236, 110, 115], 0.55),
-    lips: mixColor(hsl(h - 5, s + 0.07, l - 0.12), [196, 88, 92], 0.5),
-  };
-}
-
-/** Hair: flat base, a shadow and a glossy highlight band, plus eyebrow color. */
-function styleHair(c) {
-  const [h, s0, l0] = rgbToHsl(c[0], c[1], c[2]);
-  // Lift very dark hair a little so it isn't a black hole, and keep dark hair
-  // neutral (a photo's warm light cast would otherwise turn black hair brown).
-  const l = clamp(l0 * 1.15, 0.11, 0.55);
-  const s = l0 < 0.2 ? Math.min(s0, 0.18) : clamp(s0 * 1.15, 0.08, 0.6);
-  return {
-    base: hsl(h, s, l),
-    shadow: hsl(h, s, l * 0.68),
-    highlight: hsl(h, s * 0.9, l + 0.09),
-    brow: hsl(h, s, Math.min(l * 0.8, 0.25)),
-  };
-}
-
-/** Clothes and background: flatter, cleaner, more saturated; nothing pure black. */
-function styleFlat(c, lift = 0.05) {
-  const [h, s, l] = rgbToHsl(c[0], c[1], c[2]);
-  // Boost real colors, but leave near-grays neutral (boosting them invents
-  // odd olive/brown tints), and pull very dark colors toward neutral: in dim
-  // light, black and charcoal fabric picks up the light's color cast.
-  const s2 = l < 0.25 ? s * 0.35 : s < 0.12 ? s : s * 1.45; // cartoons love bold color
-  return hsl(h, s2, clamp(lift + l * (1 - lift), 0.12, 0.96));
-}
-
-/* ---------- Drawing the face ---------- */
-
-/**
- * Draw cartoon facial features for one face (landmarks `pts`, in canvas
- * pixels) with colors `skin`, `hair` and `iris`.
- * Sizes are measured in "eye widths" (`unit`) so everything scales with the face.
- */
-function drawCartoonFace(ctx, pts, skin, hair, iris, shadeSide = 1) {
-  const unit = (dist(pts[33], pts[133]) + dist(pts[263], pts[362])) / 2;
-  if (unit < 3) return; // too small to draw features
-  ctx.save();
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-
-  // Cel-shaded side shadow: one crisp shadow shape on the side of the face
-  // away from the light (`shadeSide`: -1 = left, 1 = right, from the photo).
-  const oval = pick(pts, LM.faceOval);
-  const fc = centroid(oval);
-  const fxs = oval.map((p) => p.x), fys = oval.map((p) => p.y);
-  const faceW = Math.max(...fxs) - Math.min(...fxs), faceH = Math.max(...fys) - Math.min(...fys);
-  ctx.save();
-  ctx.beginPath();
-  smoothClosedPath(ctx, oval);
-  ctx.clip();
-  ctx.fillStyle = css(skin.shadow, 0.75);
-  ctx.beginPath();
-  ctx.ellipse(fc.x + shadeSide * faceW * 0.66, fc.y + faceH * 0.06, faceW * 0.34, faceH * 0.66, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-
-  // Nose: a soft shadow line down the shaded side of the nose bridge.
-  const bridge = pick(pts, [168, 197, 195, 5]).map((p) => ({ x: p.x + shadeSide * unit * 0.2, y: p.y }));
-  ctx.beginPath();
-  smoothOpenPath(ctx, bridge);
-  ctx.strokeStyle = css(skin.line, 0.35);
-  ctx.lineWidth = unit * 0.06;
-  ctx.stroke();
-
-  // Blush: soft pink circles on the cheeks.
-  for (const idx of [LM.cheekRight, LM.cheekLeft]) {
-    const p = pts[idx], r = unit * 0.75;
-    const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
-    g.addColorStop(0, css(skin.blush, 0.55));
-    g.addColorStop(1, css(skin.blush, 0));
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.ellipse(p.x, p.y, r, r * 0.7, 0, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // Eyebrows: the landmark outline, slightly thickened, filled solid.
-  for (const brow of [LM.rightBrow, LM.leftBrow]) {
-    const poly = pick(pts, brow);
-    const c = centroid(poly);
-    ctx.beginPath();
-    smoothClosedPath(ctx, scaleAbout(poly, c.x, c.y, 1.04, 1.3));
-    ctx.fillStyle = css(hair.brow);
-    ctx.fill();
-  }
-
-  // Eyes.
-  const eyes = [
-    { ring: LM.rightEye, iris: LM.rightIris, edge: LM.rightIrisEdge },
-    { ring: LM.leftEye, iris: LM.leftIris, edge: LM.leftIrisEdge },
-  ];
-  const lineColor = '#1f1411';
-  for (const e of eyes) {
-    const ring = pick(pts, e.ring);
-    const c = centroid(ring);
-    const ew = dist(ring[0], ring[8]);
-    const ys = ring.map((p) => p.y);
-    const eh = Math.max(0.5, Math.max(...ys) - Math.min(...ys));
-    const upperIdx = e.ring.slice(0, 9);
-    const lowerIdx = [e.ring[8], ...e.ring.slice(9), e.ring[0]];
-
-    if (eh / ew < 0.14) {
-      // Squinting or laughing: draw a happy closed-eye curve instead.
-      ctx.beginPath();
-      smoothOpenPath(ctx, scaleAbout(pick(pts, upperIdx), c.x, c.y, 1.1, 1.6));
-      ctx.strokeStyle = lineColor;
-      ctx.lineWidth = unit * 0.1;
-      ctx.stroke();
-      continue;
-    }
-
-    // Cartoon eyes are a bit bigger and rounder than real ones.
-    const sy = clamp(Math.max(1.25, (ew * 0.42) / eh), 1, 2.2), sx = 1.12;
-    const shape = scaleAbout(ring, c.x, c.y, sx, sy);
-
-    ctx.beginPath();
-    smoothClosedPath(ctx, shape);
-    ctx.fillStyle = '#fbf8f3';
-    ctx.fill();
-
-    // Iris, pupil and sparkles, clipped to the eye shape.
-    ctx.save();
-    ctx.beginPath();
-    smoothClosedPath(ctx, shape);
-    ctx.clip();
-    const sys = shape.map((p) => p.y), eyeTop = Math.min(...sys), eyeBottom = Math.max(...sys);
-    const ic = pts[e.iris];
-    const icx = c.x + (ic.x - c.x) * sx, icy = c.y + (ic.y - c.y) * sy;
-    const measured = pick(pts, e.edge).reduce((sum, p) => sum + dist(p, ic), 0) / 4;
-    const ir = clamp(measured * 1.2, ew * 0.22, ew * 0.36);
-    const grad = ctx.createRadialGradient(icx, icy + ir * 0.3, ir * 0.1, icx, icy, ir);
-    grad.addColorStop(0, css(mixColor(iris, [255, 255, 255], 0.25)));
-    grad.addColorStop(1, css(mixColor(iris, [0, 0, 0], 0.35)));
-    ctx.fillStyle = grad;
-    ctx.beginPath(); ctx.arc(icx, icy, ir, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#140c09';
-    ctx.beginPath(); ctx.arc(icx, icy, ir * 0.5, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(icx - ir * 0.35, icy - ir * 0.4, ir * 0.3, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(icx + ir * 0.32, icy + ir * 0.28, ir * 0.12, 0, Math.PI * 2); ctx.fill();
-    // Thin darker ring around the iris, and the upper lid's shadow across the top of the eye.
-    ctx.strokeStyle = css(mixColor(iris, [0, 0, 0], 0.6), 0.8);
-    ctx.lineWidth = Math.max(0.6, ir * 0.12);
-    ctx.beginPath(); ctx.arc(icx, icy, ir, 0, Math.PI * 2); ctx.stroke();
-    const lidShadow = ctx.createLinearGradient(0, eyeTop, 0, eyeTop + (eyeBottom - eyeTop) * 0.45);
-    lidShadow.addColorStop(0, css(skin.line, 0.35));
-    lidShadow.addColorStop(1, css(skin.line, 0));
-    ctx.fillStyle = lidShadow;
-    ctx.fillRect(c.x - ew, eyeTop, ew * 2, eyeBottom - eyeTop);
-    ctx.restore();
-
-    // Bold upper lid with a little lash flick at the outer corner; thin lower lid.
-    const upper = scaleAbout(pick(pts, upperIdx), c.x, c.y, sx, sy);
-    ctx.beginPath();
-    smoothOpenPath(ctx, upper);
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = unit * 0.11;
-    ctx.stroke();
-    const out = upper[0], nextPt = upper[1];
-    const len = Math.max(1e-3, dist(out, nextPt));
-    const dx = (out.x - nextPt.x) / len, dy = (out.y - nextPt.y) / len;
-    ctx.beginPath();
-    ctx.moveTo(out.x, out.y);
-    ctx.lineTo(out.x + dx * unit * 0.2, out.y + dy * unit * 0.2 - unit * 0.1);
-    ctx.lineWidth = unit * 0.08;
-    ctx.stroke();
-
-    // Eyelid crease: a thin curve above the middle of the upper lid.
-    const crease = upper.slice(2, 8).map((p) => ({ x: p.x, y: p.y - unit * 0.2 }));
-    ctx.beginPath();
-    smoothOpenPath(ctx, crease);
-    ctx.strokeStyle = css(skin.line, 0.5);
-    ctx.lineWidth = unit * 0.045;
-    ctx.stroke();
-
-    ctx.beginPath();
-    smoothOpenPath(ctx, scaleAbout(pick(pts, lowerIdx), c.x, c.y, sx, sy));
-    ctx.strokeStyle = css(skin.line, 0.55);
-    ctx.lineWidth = unit * 0.045;
-    ctx.stroke();
-  }
-
-  // Nose: just a small curve under the tip, the classic cartoon nose.
-  const nb = pts[LM.noseBottom];
-  const nr = lerpPt(pts[LM.noseRight], nb, 0.35), nl = lerpPt(pts[LM.noseLeft], nb, 0.35);
-  ctx.beginPath();
-  ctx.moveTo(nr.x, nr.y);
-  ctx.quadraticCurveTo(nb.x, nb.y + unit * 0.12, nl.x, nl.y);
-  ctx.strokeStyle = css(skin.line, 0.85);
-  ctx.lineWidth = unit * 0.075;
-  ctx.stroke();
-  // Nostril wings: small curves on each side of the nose.
-  for (const idx of [LM.noseRight, LM.noseLeft]) {
-    const wing = pts[idx];
-    const side = Math.sign(wing.x - nb.x) || 1;
-    const end = lerpPt(wing, nb, 0.3);
-    ctx.beginPath();
-    ctx.moveTo(wing.x, wing.y - unit * 0.14);
-    ctx.quadraticCurveTo(wing.x + side * unit * 0.07, wing.y + unit * 0.04, end.x, end.y + unit * 0.02);
-    ctx.strokeStyle = css(skin.line, 0.6);
-    ctx.lineWidth = unit * 0.05;
-    ctx.stroke();
-  }
-
-  // Mouth: filled lips; open mouths get a dark inside with teeth, closed ones a lip line.
-  const outer = pick(pts, LM.lipsOuter), inner = pick(pts, LM.lipsInner);
-  const open = polygonArea(inner) / Math.max(1, polygonArea(outer)) > 0.18;
-
-  // Smile lines: when smiling, short soft curves from the nose wings toward the mouth corners.
-  if (open) {
-    for (const [wingIdx, cornerIdx] of [[LM.noseRight, 61], [LM.noseLeft, 291]]) {
-      const wing = pts[wingIdx], corner = pts[cornerIdx];
-      const side = Math.sign(wing.x - nb.x) || 1;
-      const a = { x: wing.x + side * unit * 0.28, y: wing.y + unit * 0.05 };
-      const b = { x: corner.x + side * unit * 0.22, y: corner.y - unit * 0.05 };
-      const ctrl = { x: (a.x + b.x) / 2 + side * unit * 0.12, y: (a.y + b.y) / 2 }; // bows outward
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.quadraticCurveTo(ctrl.x, ctrl.y, lerpPt(a, b, 0.8).x, lerpPt(a, b, 0.8).y);
-      ctx.strokeStyle = css(skin.line, 0.4);
-      ctx.lineWidth = unit * 0.05;
-      ctx.stroke();
-    }
-  }
-
-  ctx.beginPath();
-  smoothClosedPath(ctx, outer);
-  ctx.fillStyle = css(skin.lips, 0.9);
-  ctx.fill();
-  // Upper lip a shade darker than the lower lip (light comes from above), and a small shine on the lower lip.
-  ctx.beginPath();
-  smoothClosedPath(ctx, pick(pts, LM.lipsOuter.slice(0, 11)).concat(pick(pts, LM.lipLine).reverse()));
-  ctx.fillStyle = css(mixColor(skin.lips, [60, 20, 20], 0.25), 0.9);
-  ctx.fill();
-  const shine = lerpPt(pts[17], pts[14], 0.45);
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
-  ctx.beginPath();
-  ctx.ellipse(shine.x, shine.y, unit * 0.18, unit * 0.06, 0, 0, Math.PI * 2);
-  ctx.fill();
-  if (open) {
-    ctx.beginPath();
-    smoothClosedPath(ctx, inner);
-    ctx.fillStyle = '#5b2323';
-    ctx.fill();
-    ctx.save();
-    ctx.beginPath();
-    smoothClosedPath(ctx, inner);
-    ctx.clip();
-    const iys = inner.map((p) => p.y), top = Math.min(...iys), bottom = Math.max(...iys);
-    const ixs = inner.map((p) => p.x);
-    ctx.fillStyle = '#fbf7f0';
-    ctx.fillRect(Math.min(...ixs), top, Math.max(...ixs) - Math.min(...ixs), (bottom - top) * 0.5);
-    ctx.restore();
-    ctx.beginPath();
-    smoothClosedPath(ctx, inner);
-    ctx.strokeStyle = css(skin.line);
-    ctx.lineWidth = unit * 0.06;
-    ctx.stroke();
-  } else {
-    ctx.beginPath();
-    smoothOpenPath(ctx, pick(pts, LM.lipLine));
-    ctx.strokeStyle = css(skin.line);
-    ctx.lineWidth = unit * 0.075;
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-/* ---------- The cartoon pipeline ---------- */
-
-/**
- * Cartoon background: the scene flattened into big simple color shapes.
- * Kuwahara smoothing + k-means (10 colors) + a majority filter give clean
- * "vector" regions. Night skies are repainted and lights get a soft glow.
- * Returns flat colors plus the region labels (used for thin background lines).
- */
-async function cartoonBackground(photo, w, h, night) {
-  // 10 colors and light smoothing: enough simplification to look drawn, but
-  // buildings, windows and railings stay recognizable.
-  // Strong Kuwahara passes and a wide majority filter, so textured walls,
-  // carpets and foliage become calm shapes instead of blotches.
-  const K = 8;
-  const { labels, centers } = await runPaintStage(photo, w, h, { radii: [7, 5], k: K, maxIter: 12 });
-  let clean = majorityFilter(labels, w, h, K, 4);
-  clean = majorityFilter(clean, w, h, K, 4);
-  const palette = [];
-  for (let c = 0; c < K; c++) {
-    let col = styleFlat([centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]], 0.08);
-    if (night) {
-      // Cartoon nights are blue: tint the darker shapes toward twilight blue (lights stay warm).
-      const l = rgbToHsl(col[0], col[1], col[2])[2];
-      col = mixColor(col, [44, 58, 112], clamp((0.85 - l) / 0.6, 0, 1) * 0.55);
-    }
-    palette.push(col);
-  }
-  const rgba = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0; i < clean.length; i++) {
-    const c = palette[clean[i]];
-    rgba[i * 4] = c[0]; rgba[i * 4 + 1] = c[1]; rgba[i * 4 + 2] = c[2]; rgba[i * 4 + 3] = 255;
-  }
-  // No blur and no glow here: soft edges and haze are what make an image read
-  // as a *painting*. Cartoons use crisp, flat shapes with hard edges.
-  const sky = detectSkyMask(photo, w, h, night);
-  if (sky) paintAnimeSky(rgba, w, h, sky, w, h, night, true);
-  return { rgba, labels: clean, sky };
-}
-
-/**
- * Build the Cartoon result from an <img>.
- */
-async function buildCartoon(image, detail, onStatus) {
-  onStatus('Loading the cartoon tools…');
-  const progress = [0, 0];
-  const report = () => onStatus(`Downloading the cartoon tools (first time only)… ${Math.round(((progress[0] + progress[1]) / 2) * 100)}%`);
-  await Promise.all([
-    getSegmenter((p) => { progress[0] = p; report(); }),
-    getLandmarker((p) => { progress[1] = p; report(); }),
-  ]);
-
-  const { width: w, height: h, data } = downscaleImage(image, SETTINGS.cartoonSide);
-  const night = averageLightness(data) < 0.28;
-  const photo = new Uint8ClampedArray(data);
-  applyLut(photo, makeLevelsLut(photo)); // brighten dark photos so colors read clearly
-  const photoCanvas = makeCanvas(w, h);
-  photoCanvas.getContext('2d').putImageData(new ImageData(photo, w, h), 0, 0);
-
-  // 1. Which pixel is hair / skin / clothes / background?
-  onStatus('Finding hair, skin and clothes…');
-  await nextFrame();
-  const segmenter = await getSegmenter();
-  const seg = segmenter.segment(photoCanvas);
-  const conf = seg.confidenceMasks.map((m) => {
-    const a = new Float32Array(m.getAsFloat32Array());
-    return m.width === w && m.height === h ? a : resizeMask(a, m.width, m.height, w, h);
-  });
-  seg.close();
-
-  // Blur each class's confidence map, then give every pixel its most likely
-  // class. Blurring first rounds off jagged edges into smooth, drawable shapes.
-  const soft = conf.map((m) => blurTimes(m, w, h, 3));
-  soft[SEG.CLOTHES] = soft[SEG.CLOTHES].map((v, i) => v + (soft[SEG.OTHER] ? soft[SEG.OTHER][i] : 0)); // accessories count as clothes
-  const labels = new Uint8Array(w * h);
-  for (let i = 0; i < labels.length; i++) {
-    let best = 0, bestV = -1;
-    for (let c = 0; c < 5; c++) if (soft[c][i] > bestV) { bestV = soft[c][i]; best = c; }
-    labels[i] = best;
-  }
-  let personCount = 0;
-  for (let i = 0; i < labels.length; i++) if (labels[i] !== SEG.BG) personCount++;
-
-  // 2. Face landmarks.
-  onStatus('Finding eyes, nose and mouth…');
-  await nextFrame();
-  const faces = await findFaceLandmarks(photoCanvas);
-  // Inside each face, everything becomes face skin: we draw the eyes, brows
-  // and mouth ourselves, so the photo's versions must not show through.
-  for (const pts of faces) {
-    const oval = pick(pts, LM.faceOval);
-    const c = centroid(oval);
-    const inner = polygonMask(scaleAbout(oval, c.x, c.y, 0.86, 0.86), w, h);
-    for (let i = 0; i < labels.length; i++) if (inner[i]) labels[i] = SEG.FACE;
-  }
-
-  // 3. The background, flattened.
-  onStatus('Simplifying the background…');
-  await nextFrame();
-  const bg = await cartoonBackground(photo, w, h, night);
-
-  // 4. Character colors, taken from the photo.
-  onStatus('Coloring…');
-  await nextFrame();
-  // Skin tone must match the person. The hue and saturation come from the
-  // ORIGINAL photo; the brightness is the original's, moved only 35% of the
-  // way toward the brightened copy (so faces in very dark photos still read
-  // as lit, without washing out someone's real skin tone). Hair and clothes
-  // come from the original too, so black hair stays black.
-  // (toneSample ignores flash glare and shine; see its comment.)
-  const skinClasses = [SEG.FACE, SEG.BODY];
-  const skinOrig = toneSample(data, labels, skinClasses, 0.25, 0.55, 0.12);
-  const skinLit = toneSample(photo, labels, skinClasses, 0.25, 0.55, 0.12);
-  let skinSample = [200, 150, 120];
-  if (skinOrig && skinLit) {
-    const [sh, ss, sl] = rgbToHsl(...skinOrig);
-    const litL = rgbToHsl(...skinLit)[2];
-    // Dark (night/indoor) photos underexpose skin, so they lean more on the brightened copy.
-    skinSample = hsl(sh, ss, sl + (litL - sl) * (night ? 0.6 : 0.35));
-  }
-  const hairSample = toneSample(data, labels, [SEG.HAIR], 0.15, 0.45) || [35, 28, 25];
-  const skin = styleSkin(skinSample), hair = styleHair(hairSample);
-
-  // Shading uses brightness from a heavily blurred photo (big, soft light and shadow areas only).
-  const lumSharp = toGrayscale(photo, w, h);
-  const lum = blurTimes(lumSharp, w, h, 6);
-  const lumMedian = (label, source = lum) => {
-    const vals = [];
-    for (let i = 0; i < labels.length; i += 3) if (labels[i] === label) vals.push(source[i]);
-    vals.sort((a, b) => a - b);
-    return vals.length ? vals[vals.length >> 1] : 128;
-  };
-  const faceLum = lumMedian(SEG.FACE);
-  const lumHair = blurTimes(lumSharp, w, h, 2);
-  const hairLumFine = lumMedian(SEG.HAIR, lumHair);
-
-  // Where hair is close, it casts a shadow onto the forehead (a classic cartoon touch).
-  const hairNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.HAIR ? 1 : 0)), w, h, 5);
-  // The face casts a shadow onto the neck just below the jaw. "Just below the
-  // jaw" = body-skin pixels close to the face (a blurred face mask) and
-  // lower than the face's center, which follows the jawline even when the
-  // head is tilted (a straight horizontal cut looked like a band).
-  const faceNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.FACE ? 1 : 0)), w, h, 8);
-  let faceCenterY = Infinity;
-  for (const pts of faces) faceCenterY = Math.min(faceCenterY, centroid(pick(pts, LM.faceOval)).y);
-
-  // Tone maps (0 = shadow, 1 = base, 2 = highlight), smoothed into blobby cel shapes.
-  const shadowRaw = new Float32Array(w * h), highlightRaw = new Float32Array(w * h);
-  for (let i = 0; i < labels.length; i++) {
-    const l = labels[i], y = (i / w) | 0;
-    if (l === SEG.FACE) {
-      shadowRaw[i] = hairNear[i] > 0.25 || lum[i] < faceLum * 0.7 ? 1 : 0;
-    } else if (l === SEG.BODY) {
-      const underJaw = faces.length && y > faceCenterY && faceNear[i] > 0.12;
-      shadowRaw[i] = underJaw || lum[i] < faceLum * 0.68 ? 1 : 0;
-    } else if (l === SEG.HAIR) {
-      // Hair uses a less-blurred brightness so curls and clumps show as
-      // separate shapes: darker clumps, the base, and lighter shine.
-      shadowRaw[i] = lumHair[i] < hairLumFine * 0.85 ? 1 : 0;
-      highlightRaw[i] = lumHair[i] > hairLumFine * 1.6 + 10 ? 1 : 0; // only the brightest shine (flash glare made big blobs)
-    } else if (l === SEG.CLOTHES) {
-      shadowRaw[i] = 0; // set below, relative to the clothes' own brightness
-    }
-  }
-
-  // Clothes: ONE base color (median of the original photo) with one soft
-  // shadow tone for folds, plus small high-contrast details (logos, zips,
-  // piping) as their own light color. Many k-means colors looked like camouflage.
-  const clothesLum = lumMedian(SEG.CLOTHES), clothesSharpLum = lumMedian(SEG.CLOTHES, lumSharp);
-  const clothesSample = medianColor(data, labels, SEG.CLOTHES);
-  const clothes = clothesSample ? {
-    base: styleFlat(clothesSample, 0.1),
-    shadow: styleFlat(clothesSample.map((v) => v * 0.62), 0.06),
-  } : null;
-  const detailRaw = new Float32Array(w * h);
-  const lumLight = gaussianBlur(lumSharp, w, h);
-  for (let i = 0; i < labels.length; i++) {
-    if (labels[i] !== SEG.CLOTHES) continue;
-    shadowRaw[i] = lum[i] < clothesLum * 0.8 ? 1 : 0;
-    detailRaw[i] = lumLight[i] > clothesSharpLum + 75 ? 1 : 0;
-  }
-  // Blurring 3 times before the 0.5 threshold makes tiny specks (polka dots,
-  // sparkles) vanish while real details like a logo or a zip survive.
-  const detailMask = blurTimes(detailRaw, w, h, 3);
-  const detailColor = (() => {
-    const tmp = new Uint8Array(w * h);
-    for (let i = 0; i < tmp.length; i++) tmp[i] = detailMask[i] > 0.5 ? 1 : 0;
-    const c = medianColor(photo, tmp, 1);
-    return c ? styleFlat(c, 0.1) : [236, 236, 236];
-  })();
-
-  const shadow = blurTimes(shadowRaw, w, h, 3), highlight = blurTimes(highlightRaw, w, h, 3);
-
-  // 5. Paint the character over the background (soft 1–2 px edge from the segmenter's confidence).
-  const painted = new Uint8ClampedArray(bg.rgba);
-  for (let i = 0; i < labels.length; i++) {
-    const l = labels[i];
-    let c = null;
-    if (l === SEG.FACE || l === SEG.BODY) c = shadow[i] > 0.5 ? skin.shadow : skin.base;
-    else if (l === SEG.HAIR) c = highlight[i] > 0.5 ? hair.highlight : shadow[i] > 0.5 ? hair.shadow : hair.base;
-    else if (l === SEG.CLOTHES && clothes) c = detailMask[i] > 0.5 ? detailColor : shadow[i] > 0.5 ? clothes.shadow : clothes.base;
-    const alpha = clamp((0.62 - soft[SEG.BG][i]) / 0.24, 0, 1); // 1 inside the person, fading out at the edge
-    if (!c || alpha <= 0) continue;
-    const j = i * 4;
-    painted[j] += (c[0] - painted[j]) * alpha;
-    painted[j + 1] += (c[1] - painted[j + 1]) * alpha;
-    painted[j + 2] += (c[2] - painted[j + 2]) * alpha;
-  }
-
-  // 6. Draw the faces.
-  if (faces.length) {
-    onStatus(faces.length > 1 ? `Drawing ${faces.length} faces…` : 'Drawing the face…');
-    await nextFrame();
-    const fc = makeCanvas(w, h);
-    const fctx = fc.getContext('2d', { willReadFrequently: true });
-    fctx.putImageData(new ImageData(painted, w, h), 0, 0);
-    for (const pts of faces) {
-      // Iris color: sampled from the photo at the iris, then deepened; brown if unclear.
-      const ic = pts[LM.rightIris];
-      const ii = (Math.round(ic.y) * w + Math.round(ic.x)) * 4;
-      const [ih, is, il] = rgbToHsl(photo[ii], photo[ii + 1], photo[ii + 2]);
-      const iris = is > 0.15 ? hsl(ih, Math.min(0.7, is * 1.3), clamp(il, 0.22, 0.4)) : [92, 58, 38];
-      // Which side of the face is darker in the photo? That side gets the cel shadow.
-      const noseX = pts[LM.noseBottom].x;
-      let leftSum = 0, leftN = 0, rightSum = 0, rightN = 0;
-      const oval = pick(pts, LM.faceOval);
-      const minY = Math.max(0, Math.round(Math.min(...oval.map((p) => p.y))));
-      const maxY = Math.min(h - 1, Math.round(Math.max(...oval.map((p) => p.y))));
-      for (let y = minY; y <= maxY; y += 2) {
-        for (let x = 0; x < w; x += 2) {
-          const i = y * w + x;
-          if (labels[i] !== SEG.FACE) continue;
-          if (x < noseX) { leftSum += lum[i]; leftN++; } else { rightSum += lum[i]; rightN++; }
-        }
-      }
-      const shadeSide = leftN && rightN && leftSum / leftN < rightSum / rightN ? -1 : 1;
-      drawCartoonFace(fctx, pts, skin, hair, iris, shadeSide);
-    }
-    painted.set(fctx.getImageData(0, 0, w, h).data);
-  }
-
-  // 7. Outlines. Bold lines along every border between character regions
-  //    (and between clothes colors), traced from a "label map" image where
-  //    each region is a different flat gray, so edges are exactly the borders.
-  onStatus('Inking the outlines…');
-  await nextFrame();
-  const scale = outputScale(w, h);
-  const grayOf = { [SEG.BG]: 0, [SEG.HAIR]: 40, [SEG.BODY]: 150, [SEG.FACE]: 215 };
-  const labelImg = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0; i < labels.length; i++) {
-    const l = labels[i];
-    const g = l === SEG.CLOTHES ? (detailMask[i] > 0.5 ? 255 : 90) : grayOf[l];
-    labelImg[i * 4] = labelImg[i * 4 + 1] = labelImg[i * 4 + 2] = g;
-    labelImg[i * 4 + 3] = 255;
-  }
-  const personStrokes = extractRawStrokes(labelImg, w, h, { detail: 85, strictness: 1, minPoints: 12 });
-  for (const s of personStrokes) {
-    const p = strokeProminence(s);
-    s.outlineWidth = (2.8 + 1.8 * p) / scale;   // 2.8–4.6 px: bold, even cartoon ink
-    s.outlineColor = '#22160f';
-    s.outlineAlpha = 1;
-  }
-
-  // Clothing detail lines: seams, zips, pocket edges and big folds, traced
-  // from the PHOTO's real edges, but kept only well inside the clothes (so
-  // they don't double the silhouette). Thinner than the outline, like an
-  // illustrator's inner lines.
-  //   All inner lines are traced from a TEXTURE-FREE copy of the photo
-  //   (Kuwahara-smoothed), and texture scribbles are filtered out, so polka
-  //   dots, knit patterns, carpet and skin pores don't become lines.
-  const lineSrc = textureFree(photo, w, h, 4);
-  const insideOf = (mask, s, need) => {
-    let inside = 0;
-    for (const pt of s.points) if (mask[Math.round(pt.y) * w + Math.round(pt.x)] > 0.95) inside++;
-    return inside / s.points.length > need;
-  };
-  const innerLines = suppressTexture(extractRawStrokes(lineSrc, w, h, { detail: Math.min(100, detail + 10), strictness: 1.3, minPoints: 30 }), w, h);
-  const clothesInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.CLOTHES ? 1 : 0)), w, h, 4);
-  const clothesLines = innerLines.filter((s) => insideOf(clothesInner, s, 0.85));
-  for (const s of clothesLines) {
-    s.outlineWidth = (1.6 + 0.9 * strokeProminence(s)) / scale; // 1.6–2.5 px
-    s.outlineColor = '#1a1210';
-    s.outlineAlpha = 0.85;
-  }
-  personStrokes.push(...clothesLines);
-
-  // Skin lines: where an arm crosses the body, fingers, elbows and knees.
-  // Arms, hands and chest are all "body skin" to the segmenter, so without
-  // these they'd merge into one flat blob.
-  const skinInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.BODY ? 1 : 0)), w, h, 3);
-  const skinLines = innerLines.filter((s) => insideOf(skinInner, s, 0.8));
-  for (const s of skinLines) {
-    s.outlineWidth = (1.7 + 1.0 * strokeProminence(s)) / scale; // 1.7–2.7 px
-    s.outlineColor = css(mixColor(skin.line, [0, 0, 0], 0.35));
-    s.outlineAlpha = 0.9;
-  }
-  personStrokes.push(...skinLines);
-
-  // Hair strands: the photo's own edges inside the hair (curls, parting,
-  // clumps), drawn as fine lines. Strands along bright, shiny hair are drawn
-  // in the highlight color; the rest in a darker hair tone. This is what makes
-  // hair read as hair instead of a flat helmet.
-  const hairInner = blurTimes(Float32Array.from(labels, (l) => (l === SEG.HAIR ? 1 : 0)), w, h, 2);
-  // (Hair uses a lighter smoothing, radius 2, so strands survive but frizz and noise don't.)
-  const hairLines = suppressTexture(
-    extractRawStrokes(textureFree(photo, w, h, 2), w, h, { detail: Math.min(100, detail + 25), strictness: 1.15, minPoints: 20 }),
-    w, h, { maxDensity: 0.12 })
-    .filter((s) => {
-      let inside = 0;
-      for (const pt of s.points) if (hairInner[Math.round(pt.y) * w + Math.round(pt.x)] > 0.9) inside++;
-      return inside / s.points.length > 0.85;
-    });
-  const strandDark = css(mixColor(hair.shadow, [0, 0, 0], 0.45));
-  const strandLight = css(mixColor(hair.highlight, [255, 255, 255], 0.2));
-  for (const s of hairLines) {
-    let sum = 0;
-    for (const pt of s.points) sum += lumHair[Math.round(pt.y) * w + Math.round(pt.x)];
-    const shiny = sum / s.points.length > hairLumFine * 1.3;
-    s.outlineWidth = (shiny ? 1.6 : 1.3 + 0.6 * strokeProminence(s)) / scale;
-    s.outlineColor = shiny ? strandLight : strandDark;
-    s.outlineAlpha = shiny ? 0.8 : 0.9;
-  }
-  personStrokes.push(...hairLines);
-
-  // Background ink: thin lines traced from the PHOTO's real edges (building
-  // outlines, windows, railings, the horizon), so the scene keeps its
-  // structure. The Edge detail slider controls how many.
-  const personNear = blurTimes(Float32Array.from(labels, (l) => (l === SEG.BG ? 0 : 1)), w, h, 3);
-  const bgRaw = suppressTexture(extractRawStrokes(lineSrc, w, h, { detail, strictness: 1.4, minPoints: 36 }), w, h, { maxDensity: 0.07 });
-  const bgStrokes = bgRaw.filter((s) => {
-    let inside = 0;
-    for (const pt of s.points) {
-      const i = Math.round(pt.y) * w + Math.round(pt.x);
-      if (personNear[i] > 0.1 || (bg.sky && bg.sky[i] > 0.3)) inside++;
-    }
-    return inside / s.points.length < 0.2; // not over (or hugging) the character, and not in the painted sky
-  });
-  for (const s of bgStrokes) {
-    s.outlineWidth = (1.2 + 1.0 * strokeProminence(s)) / scale; // 1.2–2.2 px
-    s.outlineColor = night ? '#171630' : '#352c48';
-    s.outlineAlpha = 0.75;
-  }
-  const strokes = finalizeStrokes(personStrokes.concat(bgStrokes));
-
-  // The live animation's "paint wash" plan (which regions appear first).
-  const { labels: washLabels, centers } = await runPaintStage(painted, w, h, { radii: [], k: 12, maxIter: 10 });
-  const art = makeStorybookArt({
-    w, h, painted, grain: makePaperGrain(w, h), labels: washLabels, centers,
-    customStrokes: strokes, outlineOpacity: 1, faces: faces.length,
-  });
-  art.mode = 'cartoon';
-  if (personCount < w * h * 0.01) art.note = 'No person found, so the scene itself was cartoonized.';
-  else if (!faces.length) art.note = "Couldn't find a clear face, so facial features weren't drawn. A closer, front-facing photo works best.";
-  return art;
-}
-
-/**
- * Find the sky, conservatively. Returns a soft mask (0–1 per pixel) or null.
- * Sky in a photo is (a) smooth, with almost no edges, (b) fairly bright,
- * and (c) connected to the top edge of the picture. So we mark smooth, bright
- * pixels as candidates and "flood fill" down from the top row through
- * connected candidates. The flood stops at edges like rooftops, hills and
- * heads. We only accept the result if it really looks like sky: it touches
- * most of the top edge, sits in the upper part of the image, has a sensible
- * size, and is blue (or it's a night photo). Otherwise, for example with an
- * indoor wall, we leave the picture alone.
- */
-function detectSkyMask(rgba, w, h, night) {
-  const gray = gaussianBlur(toGrayscale(rgba, w, h), w, h);
-  const { magnitude } = sobelEdges(gray, w, h);
-
-  // Typical sky brightness = median lightness of the top 5% of rows. Sky
-  // pixels must stay close to it, so hazy hills or dark trees that are just as
-  // smooth (but darker) don't get swallowed.
-  const topRows = Math.max(2, Math.round(h * 0.05));
-  const topL = [];
-  for (let i = 0; i < topRows * w; i++) topL.push(gray[i] / 255);
-  topL.sort((a, b) => a - b);
-  const skyL = topL[topL.length >> 1];
-
-  const cand = new Uint8Array(w * h);
-  for (let i = 0, j = 0; i < w * h; i++, j += 4) {
-    const [hue, s, l] = rgbToHsl(rgba[j], rgba[j + 1], rgba[j + 2]);
-    const lamp = s > 0.4 && (hue < 70 || hue > 330) && l > 0.5; // warm lights aren't sky
-    // Skies get BRIGHTER toward the horizon (haze, city glow), while hills and
-    // trees are DARKER, so we allow much more room upward than downward.
-    const diff = gray[i] / 255 - skyL;
-    const nearSkyBrightness = diff > (night ? -0.16 : -0.25) && diff < 0.45;
-    cand[i] = magnitude[i] < 18 && l > (night ? 0.12 : 0.35) && nearSkyBrightness && !lamp ? 1 : 0;
-  }
-  // Rows 0 and h-1 have no Sobel value; treat the top row like row 1.
-  for (let x = 0; x < w; x++) cand[x] = cand[w + x];
-
-  const mask = new Uint8Array(w * h);
-  const stack = new Int32Array(w * h);
-  let top = 0;
-  for (let x = 0; x < w; x++) if (cand[x]) { mask[x] = 1; stack[top++] = x; }
-  while (top > 0) {
-    const i = stack[--top];
-    const x = i % w, y = (i / w) | 0;
-    const neighbors = [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1];
-    for (const j of neighbors) if (j >= 0 && cand[j] && !mask[j]) { mask[j] = 1; stack[top++] = j; }
-  }
-
-  // Is it really sky?
-  let area = 0, sumY = 0, r = 0, g = 0, b = 0, topTouch = 0;
-  for (let x = 0; x < w; x++) topTouch += mask[w + x];
-  for (let i = 0; i < w * h; i++) {
-    if (!mask[i]) continue;
-    area++; sumY += (i / w) | 0;
-    r += rgba[i * 4]; g += rgba[i * 4 + 1]; b += rgba[i * 4 + 2];
-  }
-  if (!area) return null;
-  const [meanHue, meanSat] = rgbToHsl(r / area, g / area, b / area);
-  const blueish = meanSat > 0.12 && meanHue > 180 && meanHue < 260;
-  const areaFrac = area / (w * h);
-  const ok = topTouch / w > 0.5 && areaFrac > 0.06 && areaFrac < 0.7 && sumY / area < 0.4 * h && (blueish || night);
-  if (!ok) return null;
-
-  // Close small holes (birds, wires, stars), then soften the edge by a couple of pixels.
-  let soft = new Float32Array(w * h);
-  for (let i = 0; i < soft.length; i++) soft[i] = mask[i];
-  soft = gaussianBlur(gaussianBlur(soft, w, h), w, h);
-  for (let i = 0; i < soft.length; i++) soft[i] = soft[i] > 0.6 ? 1 : 0; // > 0.5 also shrinks it a hair, so no fringe on edges
-  return gaussianBlur(soft, w, h);
-}
-
-/**
- * Paint an anime sky into the masked area (in place).
- * - A vertical gradient: deep at the top, lighter toward the horizon.
- * - Night: a warm glow above the horizon (city light on the clouds) and
- *   small twinkling stars in the upper sky.
- * - Clouds from layered value noise, stretched sideways into long streaks.
- *   A sharp threshold gives them the crisp, cel-shaded edge of anime clouds,
- *   with a second, brighter band as the sunlit (or moonlit) highlight.
- * `maskSmall` is at size (mw × mh) and is scaled up to the painting's size.
- */
-function paintAnimeSky(painted, w, h, maskSmall, mw, mh, night, crisp = false) {
-  const mask = new Float32Array(w * h);
-  let skyBottom = 1;
-  for (let y = 0; y < h; y++) {
-    const my = Math.min(mh - 1, Math.floor((y * mh) / h));
-    for (let x = 0; x < w; x++) {
-      const m = maskSmall[my * mw + Math.min(mw - 1, Math.floor((x * mw) / w))];
-      mask[y * w + x] = m;
-      if (m > 0.5 && y > skyBottom) skyBottom = y;
-    }
-  }
-
-  const colors = night
-    ? { top: [14, 24, 62], mid: [38, 56, 118], low: [96, 96, 150], glow: [255, 176, 120], cloud: [58, 70, 122], lit: [120, 126, 178] }
-    : { top: [52, 120, 214], mid: [96, 164, 236], low: [178, 216, 246], glow: [255, 236, 214], cloud: [236, 241, 250], lit: [255, 255, 255] };
-  const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-
-  // Cloud noise, stretched ~2.5x horizontally (we sample it with a squashed y).
-  const big = makeValueNoise(w, h, 110), med = makeValueNoise(w, h, 45), fine = makeValueNoise(w, h, 14);
-  const cloudAt = (x, y) => {
-    const i = Math.min(h - 1, Math.floor(y * 2.5)) * w + x;
-    // Cartoon clouds skip the fine noise layer, so their outlines are smooth, simple curves.
-    return crisp ? 0.62 * big[i] + 0.38 * med[i] : 0.55 * big[i] + 0.3 * med[i] + 0.15 * fine[i];
-  };
-
-  for (let y = 0; y < h; y++) {
-    const t = clamp(y / skyBottom, 0, 1); // 0 at the top of the picture, 1 at the horizon
-    let c = t < 0.6 ? mix(colors.top, colors.mid, t / 0.6) : mix(colors.mid, colors.low, (t - 0.6) / 0.4);
-    c = mix(c, colors.glow, Math.pow(t, 3) * (night ? 0.45 : 0.25));
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      const m = mask[i];
-      if (m <= 0) continue;
-      const n = cloudAt(x, y);
-      let px = c;
-      // Cloud edges: soft for the painted look; for cartoons, fewer clouds with
-      // hard, flat edges (a fade of just ~1 pixel keeps them anti-aliased).
-      const cloud = crisp
-        ? clamp((n - 0.6) / 0.008, 0, 1)
-        : clamp((n - 0.56) / 0.05, 0, 1) * (0.35 + 0.65 * t);
-      if (cloud > 0) {
-        const lit = crisp ? clamp((n - 0.67) / 0.008, 0, 1) : clamp((n - 0.66) / 0.04, 0, 1); // brighter band inside the cloud
-        px = mix(px, mix(colors.cloud, colors.lit, lit), cloud * (crisp ? 1 : night ? 0.75 : 0.9));
-      }
-      const j = i * 4;
-      painted[j] += (px[0] - painted[j]) * m;
-      painted[j + 1] += (px[1] - painted[j + 1]) * m;
-      painted[j + 2] += (px[2] - painted[j + 2]) * m;
-    }
-  }
-
-  if (night) {
-    // Stars: a few hundred small soft dots in the upper, cloud-free sky.
-    const count = Math.round(w * h * 0.0005);
-    for (let s = 0; s < count; s++) {
-      const x = Math.floor(Math.random() * w), y = Math.floor(Math.random() * skyBottom * 0.75);
-      if (mask[y * w + x] < 0.95 || cloudAt(x, y) > 0.54) continue;
-      const bright = 150 + Math.random() * 105, rad = Math.random() < 0.15 ? 1.6 : 0.9;
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -2; dx <= 2; dx++) {
-          const X = x + dx, Y = y + dy;
-          if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
-          const a = clamp(1 - Math.hypot(dx, dy) / (rad + 0.6), 0, 1) * mask[Y * w + X];
-          if (a <= 0) continue;
-          const j = (Y * w + X) * 4;
-          painted[j] += (bright - painted[j]) * a;
-          painted[j + 1] += (bright - painted[j + 1]) * a;
-          painted[j + 2] += (Math.min(255, bright + 20) - painted[j + 2]) * a;
-        }
-      }
-    }
-  }
-}
-
 /** Average brightness (0–1) of RGBA pixels. */
 function averageLightness(rgba) {
   let sum = 0;
   for (let j = 0; j < rgba.length; j += 4) sum += 0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2];
   return sum / (rgba.length / 4) / 255;
-}
-
-/**
- * Soft glow ("bloom") around bright lights, especially street lights and
- * windows at night.
- * 1. Keep only the brightest pixels (a "bright pass"), tinted warm.
- * 2. Blur them a lot. A cheap blur trick: shrink the image to 1/8 and 1/24
- *    size, then stretch it back up with smoothing.
- * 3. Add the glow back with a "screen" blend: result = 1 − (1 − a)(1 − b),
- *    which only ever brightens and never blows past white.
- * Bright daytime scenes (lots of bright sky) get less glow so they don't turn hazy.
- */
-function addLightGlow(rgba, w, h) {
-  const bright = new Uint8ClampedArray(rgba.length);
-  let brightCount = 0;
-  for (let j = 0; j < rgba.length; j += 4) {
-    const lum = 0.299 * rgba[j] + 0.587 * rgba[j + 1] + 0.114 * rgba[j + 2];
-    const t = clamp((lum - 175) / 60, 0, 1);
-    if (t > 0) brightCount++;
-    bright[j] = rgba[j] * t;
-    bright[j + 1] = rgba[j + 1] * t * 0.9;
-    bright[j + 2] = rgba[j + 2] * t * 0.7;
-    bright[j + 3] = 255;
-  }
-  const strength = 0.75 * clamp(1 - (brightCount / (w * h)) * 3, 0.25, 1);
-
-  const src = makeCanvas(w, h);
-  src.getContext('2d').putImageData(new ImageData(bright, w, h), 0, 0);
-  const glow = makeCanvas(w, h);
-  const gctx = glow.getContext('2d', { willReadFrequently: true });
-  gctx.imageSmoothingQuality = 'high';
-  for (const [div, alpha] of [[8, 0.7], [24, 0.8]]) {
-    const small = makeCanvas(Math.max(1, Math.round(w / div)), Math.max(1, Math.round(h / div)));
-    const sctx = small.getContext('2d');
-    sctx.imageSmoothingQuality = 'high';
-    sctx.drawImage(src, 0, 0, small.width, small.height);
-    gctx.globalAlpha = alpha;
-    gctx.globalCompositeOperation = 'lighter';
-    gctx.drawImage(small, 0, 0, w, h);
-  }
-  const g = gctx.getImageData(0, 0, w, h).data;
-  for (let j = 0; j < rgba.length; j += 4) {
-    for (let c = 0; c < 3; c++) {
-      const a = rgba[j + c] / 255, b = (g[j + c] / 255) * strength;
-      rgba[j + c] = 255 * (1 - (1 - a) * (1 - b));
-    }
-  }
 }
 
 /** Nearest-neighbor resize of a float mask (if the segmenter returns a different size). */
@@ -2992,14 +1848,17 @@ function resizeMask(mask, mw, mh, w, h) {
 
 
 /* =============================================================================
-   4c. MODE 3: ILLUSTRATION  (a detailed digital-illustration look, on-device)
+   4c. MODES 2 & 3: CARTOON AND ILLUSTRATION  (one shared engine, on-device)
    -----------------------------------------------------------------------------
-   The Cartoon mode throws the photo's shading away and repaints flat colors,
-   which loses likeness and detail. This mode keeps the photo's REAL shapes,
-   lighting and detail, and re-renders them the way a digital illustrator
-   would. Because it works from the photo itself, it works on any picture.
-   It follows the classic "image abstraction" recipe from computer-graphics
-   research (Winnemöller et al., "Real-Time Video Abstraction"):
+   Both styles keep the photo's REAL shapes, lighting and detail and re-render
+   them the way an artist would, so they keep your likeness and work on any
+   picture. They run the same steps (buildStylized); STYLE_PRESETS decides
+   the look:
+     - Cartoon: a pencil sketch of the photo as it is, colored in with clean,
+       flat cartoon colors (strong flattening, a few clear shading tones).
+     - Illustration: a detailed digital painting with soft shading and ink.
+   The recipe comes from computer-graphics research on "image abstraction"
+   (Winnemöller et al., "Real-Time Video Abstraction"):
 
      1. Lab color: split each pixel into lightness (L) and two color axes
         (a = green↔red, b = blue↔yellow), so shading and color can be
@@ -3008,11 +1867,13 @@ function resizeMask(mask, mw, mh, w, h) {
         pores, fabric weave and noise into clean surfaces while every real
         edge stays sharp. It's region-aware (using MediaPipe's person
         segmentation): skin is smoothed most, hair and clothes keep their
-        detail, and the background goes more painterly.
-     3. Soft shading bands: lightness is gently pulled toward a few levels,
-        the stepped shading illustrators use, without hard posterization.
-     4. Ink lines with XDoG (eXtended Difference of Gaussians): artist-like
-        lines that are thick on strong edges and fade out on soft ones.
+        detail, and the background is simplified more.
+     3. Shading bands: lightness is pulled toward a few levels, the stepped
+        shading artists use (the Cartoon uses fewer, crisper bands).
+     4. Lines with XDoG (eXtended Difference of Gaussians), guided by the
+        "edge flow" so they follow shapes smoothly, like an artist's hand
+        (Kang et al., "Coherent Line Drawing"). The Illustration inks them;
+        the Cartoon draws them as graphite pencil with streaky texture.
      5. Face refinement from the 478 face landmarks: defined lash lines,
         iris ring and sparkle, cleaner brows, glossy lips.
    ============================================================================= */
@@ -3478,15 +2339,85 @@ function refineFace(ctx, pts) {
   ctx.restore();
 }
 
+/**
+ * Pencil texture: graphite on paper isn't solid. It's made of fine streaks
+ * that follow the direction of the stroke. We make that texture the way
+ * "line integral convolution" pencil-drawing methods do: start with random
+ * noise (like paper grain), then smear it ALONG the edge flow. Every pixel
+ * becomes the average of the noise along a short streamline, so the noise
+ * turns into tiny parallel streaks that follow the drawing's lines.
+ * Returns values around 0.5 (0 = light, 1 = dark streak).
+ */
+function pencilStreaks(flow, w, h, length) {
+  const n = w * h;
+  const noise = new Float32Array(n);
+  for (let i = 0; i < n; i++) noise[i] = Math.random();
+  const lic = flowSmooth(noise, flow.tx, flow.ty, w, h, length);
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += lic[i];
+  mean /= n;
+  let variance = 0;
+  for (let i = 0; i < n; i++) variance += (lic[i] - mean) ** 2;
+  const std = Math.sqrt(variance / n) || 1;
+  for (let i = 0; i < n; i++) lic[i] = clamp(0.5 + (lic[i] - mean) / (3.5 * std), 0, 1);
+  return lic;
+}
+
+/**
+ * Style presets for the shared engine below (buildStylized). Both styles
+ * run the same steps; these numbers decide the look.
+ *   Illustration: gentle smoothing, soft many-level shading, colored ink.
+ *   Cartoon: stronger flattening, 2–3 clear shading tones per area ("cel
+ *   shading"), pencil-sketch lines with a graphite texture, on paper.
+ */
+const STYLE_PRESETS = {
+  illustration: {
+    mode: 'illustration',
+    sigmaS: 32, sigmaR: { bg: 26, skin: 20, hair: 8, other: 11, even: 16 },
+    chromaBlur: 1.2, vibrance: 1.3, vibranceMuted: 0.55, skinVibrance: 1.15, warm: 1,
+    levels: 12, sharpness: 2.2, mixPerson: 0.45, mixBg: 0.8, mixEven: 0.55,
+    sCurve: 0.42, gamma: 1.07, lighten: 0,
+    lines: 'ink',
+  },
+  cartoon: {
+    mode: 'cartoon',
+    sigmaS: 44, sigmaR: { bg: 34, skin: 28, hair: 12, other: 18, even: 24 },
+    chromaBlur: 2.4, vibrance: 1.32, vibranceMuted: 0.6, skinVibrance: 1.16, warm: 0.8,
+    levels: 6, sharpness: 3.4, mixPerson: 0.85, mixBg: 0.9, mixEven: 0.88,
+    sCurve: 0.25, gamma: 1.0, lighten: 0.14,
+    lines: 'pencil',
+  },
+};
+
 /** Build the Illustration result from an <img>. */
-async function buildIllustration(image, detail, onStatus = () => {}) {
+function buildIllustration(image, detail, onStatus = () => {}) {
+  return buildStylized(image, detail, onStatus, STYLE_PRESETS.illustration);
+}
+
+/**
+ * Build the Cartoon result from an <img>: a pencil sketch of the photo as it
+ * is, colored in with clean cartoon colors (see STYLE_PRESETS.cartoon).
+ */
+function buildSketchCartoon(image, detail, onStatus = () => {}) {
+  return buildStylized(image, detail, onStatus, STYLE_PRESETS.cartoon);
+}
+
+/**
+ * The shared engine for the Illustration and Cartoon styles.
+ * Photo → (optional) person/face finding → Lab → region-aware edge-aware
+ * smoothing → even skin tone → bold color → lines (ink or pencil) →
+ * shading bands → contrast → compose → face refinement → pen strokes for
+ * the live drawing.
+ */
+async function buildStylized(image, detail, onStatus, preset) {
   const { width: w, height: h, data } = downscaleImage(image, SETTINGS.illustrationSide);
   const n = w * h;
   const scale = Math.max(w, h) / 1000; // sizes below are tuned for a 1000px image
+  const d = clamp(detail, 1, 100) / 100;
 
   // Only genuinely dark photos get a lift (up to 60% of full auto-levels).
-  // Brightening normally lit photos washed the colors out; bold
-  // illustrations keep their deep darks.
+  // Brightening normally lit photos washed the colors out; bold styles keep
+  // their deep darks.
   const photo = new Uint8ClampedArray(data);
   const avgLight = averageLightness(photo);
   const lift = clamp((0.38 - avgLight) / 0.18, 0, 1) * 0.6;
@@ -3517,7 +2448,7 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     clothes = soft(Float32Array.from(conf[SEG.CLOTHES], (v, i) => v + (conf[SEG.OTHER] ? conf[SEG.OTHER][i] : 0)));
     faces = await findFaceLandmarks(photoCanvas);
   } catch (err) {
-    console.warn('Person/face finder unavailable; illustrating the whole photo evenly:', err);
+    console.warn('Person/face finder unavailable; styling the whole photo evenly:', err);
   }
 
   onStatus('Smoothing into clean surfaces…');
@@ -3527,26 +2458,27 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
 
   // Per-pixel "edge sensitivity" (sigmaR, in Lab units): bigger = smoother.
   // The Edge detail slider scales it: more detail → less smoothing.
-  const detailFactor = 1.5 - (clamp(detail, 1, 100) / 100) * 0.9; // 1.5 … 0.6
+  const detailFactor = 1.5 - d * 0.9; // 1.5 … 0.6
+  const R = preset.sigmaR;
   const sigmaR = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    if (!person) { sigmaR[i] = 16 * detailFactor; continue; }
+    if (!person) { sigmaR[i] = R.even * detailFactor; continue; }
     const p = clamp(person[i], 0, 1), s = clamp(skin[i], 0, 1), hr = clamp(hair[i], 0, 1);
     const other = Math.max(0, 1 - s - hr);
-    const personR = 20 * s + 8 * hr + 11 * other;       // skin smooth, hair detailed, clothes in between
-    sigmaR[i] = ((1 - p) * 26 + p * personR) * detailFactor; // background more painterly
+    const personR = R.skin * s + R.hair * hr + R.other * other; // skin smooth, hair detailed, clothes in between
+    sigmaR[i] = ((1 - p) * R.bg + p * personR) * detailFactor;   // background more painterly
   }
-  domainTransformSmooth([lab.L, lab.A, lab.B], guide, w, h, 32 * scale, sigmaR, 3);
+  domainTransformSmooth([lab.L, lab.A, lab.B], guide, w, h, preset.sigmaS * scale, sigmaR, 3);
 
   // Clean, richer color: blur the color axes a little (removes blotchy color
-  // noise, like a painter's even color fills) and boost them.
-  const A = gaussianBlurSigma(lab.A, w, h, 1.2 * scale), B = gaussianBlurSigma(lab.B, w, h, 1.2 * scale);
+  // noise, like a painter's even color fills). More blur = flatter fills.
+  const A = gaussianBlurSigma(lab.A, w, h, preset.chromaBlur * scale), B = gaussianBlurSigma(lab.B, w, h, preset.chromaBlur * scale);
   const L = lab.L;
   const skinInner = skin ? blurTimes(Float32Array.from(skin, (v) => (v > 0.5 ? 1 : 0)), w, h, 3) : null;
 
   // Even skin tone. Camera flash and strong light leave glare that makes skin
-  // look pale and washed out; illustrators paint skin as an even, warm tone
-  // with soft shading. So in skin areas we (1) compress highlights above the
+  // look pale and washed out; artists paint skin as an even, warm tone with
+  // soft shading. So in skin areas we (1) compress highlights above the
   // skin's typical lightness, and (2) pull the glare's washed-out color back
   // toward the skin's real mid-tone color.
   if (skin) {
@@ -3580,32 +2512,65 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     const chroma = Math.hypot(A[i], B[i]);
     if (chroma < 1.5) continue;
     const neutralGuard = clamp((chroma - 1.5) / 3, 0, 1);
-    let k = 1.3 + 0.55 * Math.exp(-chroma / 16);
-    if (skin) k -= (k - 1.15) * clamp(skin[i], 0, 1);
+    let k = preset.vibrance + preset.vibranceMuted * Math.exp(-chroma / 16);
+    if (skin) k -= (k - preset.skinVibrance) * clamp(skin[i], 0, 1);
     k = 1 + (k - 1) * neutralGuard;
     A[i] *= k; B[i] *= k;
   }
-  // A warm illustration grade: nudge the midtones toward warm (a little more
-  // yellow/red), the golden light digital illustrations often have. Skin
-  // gets less (it's warm already); deep shadows and highlights are untouched.
+  // A warm grade: nudge the midtones toward warm (a little more yellow/red),
+  // the golden light illustrations often have. Skin gets less (it's warm
+  // already); deep shadows and highlights are untouched.
   for (let i = 0; i < n; i++) {
     const mid = clamp(1 - Math.abs(L[i] - 55) / 40, 0, 1);
     if (mid <= 0) continue;
-    const wgt = mid * (skin ? 1 - 0.6 * clamp(skin[i], 0, 1) : 1);
+    const wgt = mid * preset.warm * (skin ? 1 - 0.6 * clamp(skin[i], 0, 1) : 1);
     B[i] += 4 * wgt;
     A[i] += 1.2 * wgt;
   }
 
-  // Ink lines, traced from the smoothed lightness BEFORE sharpening (so hair
-  // texture doesn't become ink speckles). Lines inside smooth skin are
-  // softened (no wrinkle/pore lines); the Edge detail slider sets how many.
-  onStatus('Inking…');
+  // Lines. The Edge detail slider sets how many.
+  onStatus(preset.lines === 'pencil' ? 'Sketching in pencil…' : 'Inking…');
   await nextFrame();
-  const flow = edgeTangentFlow(L, w, h, 3 * scale);
-  const ink = xdogLines(L, w, h, 1.0 * scale, { eps: -0.6 + (clamp(detail, 1, 100) / 100) * 0.9, phi: 1.9, flow: { ...flow, length: 10 * scale } });
-  removeInkSpecks(ink, w, h, Math.round(16 * scale * scale));
-  if (skinInner) {
-    for (let i = 0; i < n; i++) ink[i] = 1 - (1 - ink[i]) * (1 - 0.85 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1));
+  let ink, flow;
+  if (preset.lines === 'pencil') {
+    // Pencil sketch of the photo as it is: traced from a LIGHTLY smoothed
+    // copy (so fine detail survives), with the flow-based ink method from
+    // Line art: a main layer of flowing lines plus a finer detail layer.
+    const lineL = new Float32Array(guide[0]);
+    domainTransformSmooth([lineL], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
+    flow = edgeTangentFlow(lineL, w, h, 3 * scale);
+    const main = xdogLines(lineL, w, h, 1.0 * scale, { tau: 1, eps: -1.3 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+    const fine = xdogLines(lineL, w, h, 0.6 * scale, { tau: 1, eps: -1.0 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+    const combined = new Float32Array(n);
+    for (let i = 0; i < n; i++) combined[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.6);
+    removeInkSpecks(combined, w, h, Math.round(8 * scale * scale));
+    // Pencil lines are a touch thicker than ink: each pixel takes the darkest
+    // of itself and its 4 neighbors ("dilation"), so the sketch reads clearly
+    // under the colors. Skin keeps most of its lines (a sketch shows the face).
+    ink = new Float32Array(n);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        let v = combined[i];
+        if (x > 0) v = Math.min(v, combined[i - 1] * 0.5 + 0.5 * combined[i]);
+        if (x < w - 1) v = Math.min(v, combined[i + 1] * 0.5 + 0.5 * combined[i]);
+        if (y > 0) v = Math.min(v, combined[i - w] * 0.5 + 0.5 * combined[i]);
+        if (y < h - 1) v = Math.min(v, combined[i + w] * 0.5 + 0.5 * combined[i]);
+        ink[i] = v;
+      }
+    }
+    if (skinInner) {
+      for (let i = 0; i < n; i++) ink[i] = 1 - (1 - ink[i]) * (1 - 0.3 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1));
+    }
+  } else {
+    // Ink traced from the smoothed lightness BEFORE sharpening (so hair
+    // texture doesn't become speckles); softened inside smooth skin.
+    flow = edgeTangentFlow(L, w, h, 3 * scale);
+    ink = xdogLines(L, w, h, 1.0 * scale, { eps: -0.6 + d * 0.9, phi: 1.9, flow: { ...flow, length: 10 * scale } });
+    removeInkSpecks(ink, w, h, Math.round(16 * scale * scale));
+    if (skinInner) {
+      for (let i = 0; i < n; i++) ink[i] = 1 - (1 - ink[i]) * (1 - 0.85 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1));
+    }
   }
 
   // Crisp edges everywhere except smooth skin, plus extra crispness for hair
@@ -3619,48 +2584,80 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     L[i] = clamp(L[i] + (L[i] - Lb[i]) * amount, 0, 100);
   }
 
-  // Shading bands: gentle on the person, stronger in the background.
+  // Shading bands: a few clear tones (cartoon) or soft many-level shading
+  // (illustration); the background is stepped more than the person.
   const mix = new Float32Array(n);
-  for (let i = 0; i < n; i++) mix[i] = person ? 0.45 + 0.35 * (1 - clamp(person[i], 0, 1)) : 0.55;
-  softQuantize(L, 12, 2.2, mix);
+  for (let i = 0; i < n; i++) {
+    mix[i] = person ? preset.mixPerson + (preset.mixBg - preset.mixPerson) * (1 - clamp(person[i], 0, 1)) : preset.mixEven;
+  }
+  softQuantize(L, preset.levels, preset.sharpness, mix);
 
   // Bolder light and shadow: an S-curve on lightness (done in Lab, so it
-  // adds contrast without shifting colors), with slightly deeper darks.
+  // adds contrast without shifting colors), plus the preset's gamma and a
+  // slight lightening for the Cartoon's colored-in-on-paper feel.
   for (let i = 0; i < n; i++) {
     const x = clamp(L[i] / 100, 0, 1);
-    const s = x - (0.42 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI);
-    L[i] = 100 * Math.pow(s, 1.07);
+    const s = Math.pow(x - (preset.sCurve * Math.sin(2 * Math.PI * x)) / (2 * Math.PI), preset.gamma);
+    // Lighten midtones and highlights only (a smooth ramp from 15% to 45%
+    // lightness), so dark hair and clothes stay dark while skin, walls and
+    // fabrics get the lighter "colored in" look.
+    const t = clamp((s - 0.15) / 0.3, 0, 1);
+    L[i] = 100 * (s + preset.lighten * (1 - s) * t * t * (3 - 2 * t));
   }
 
   onStatus('Coloring…');
   await nextFrame();
   const painted = labToRgba(L, A, B, new Uint8ClampedArray(n * 4));
 
-  // Ink is colored by what's underneath (dark brown on skin, near-black on
-  // hair), like an illustrator's colored line art, never flat gray.
-  // Plus a clean outline around the person from the segmentation.
-  // The person outline: a thin, crisp line along the segmentation edge
-  // (threshold the soft mask, blur it just 1 pass, and use its gradient).
+  // A thin, crisp outline along the person's edge (threshold the soft
+  // segmentation mask, blur it just 1 pass, and use its gradient).
   let outline = null;
   if (person) {
     const edge = gaussianBlur(Float32Array.from(person, (v) => (v > 0.5 ? 1 : 0)), w, h);
     const { magnitude } = sobelEdges(edge, w, h);
     outline = Float32Array.from(magnitude, (m) => clamp((m - 0.6) * 0.45, 0, 0.55));
   }
-  const contrast = new Uint8ClampedArray(256);
-  for (let v = 0; v < 256; v++) {
-    // A gentle S-curve: y = x − a·sin(2πx)/2π is steeper in the midtones
-    // (more punch) and flatter at the ends (no crushed blacks or blown whites).
-    const x = v / 255;
-    contrast[v] = 255 * (x - (0.15 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI));
-  }
-  for (let i = 0, j = 0; i < n; i++, j += 4) {
-    let e = ink[i];
-    if (outline) e = Math.min(e, 1 - outline[i] * 1.2);
-    const t = e + (1 - e) * 0.1; // ink never goes below 10% of the color: bold, but colored, lines
-    painted[j] = contrast[(painted[j] * t) | 0];
-    painted[j + 1] = contrast[(painted[j + 1] * t) | 0];
-    painted[j + 2] = contrast[(painted[j + 2] * t) | 0];
+
+  if (preset.lines === 'pencil') {
+    // Compose the pencil sketch over the colors, on paper:
+    //  - line darkness is broken up by the pencil streak texture, so lines
+    //    look like graphite, not ink;
+    //  - darker areas get a light layer of pencil shading that follows the
+    //    form (the same streaks), like an artist shading with the side of
+    //    the pencil;
+    //  - the whole picture sits on a subtle paper grain.
+    const streak = pencilStreaks(flow, w, h, 9 * scale);
+    const grain = makePaperGrain(w, h);
+    const graphite = [44, 41, 46];
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      let dark = 1 - ink[i];
+      if (outline) dark = Math.max(dark, outline[i] * 1.2);
+      const texture = clamp(0.8 + (streak[i] - 0.5) * 1.1, 0.45, 1);
+      let pd = clamp(dark * texture * 1.05, 0, 0.95);
+      const tone = clamp((45 - L[i]) / 35, 0, 1); // how dark this area is
+      const shade = tone * clamp((streak[i] - 0.45) * 2.5, 0, 1) * 0.22;
+      pd = 1 - (1 - pd) * (1 - shade);
+      const g = 1 + (grain[i] - 1) * 0.7;
+      for (let c = 0; c < 3; c++) painted[j + c] = (painted[j + c] * (1 - pd) + graphite[c] * pd) * g;
+    }
+  } else {
+    // Ink is colored by what's underneath (dark brown on skin, near-black on
+    // hair), like an illustrator's colored line art, never flat gray.
+    const contrast = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) {
+      // A gentle S-curve: y = x − a·sin(2πx)/2π is steeper in the midtones
+      // (more punch) and flatter at the ends (no crushed blacks or blown whites).
+      const x = v / 255;
+      contrast[v] = 255 * (x - (0.15 * Math.sin(2 * Math.PI * x)) / (2 * Math.PI));
+    }
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      let e = ink[i];
+      if (outline) e = Math.min(e, 1 - outline[i] * 1.2);
+      const t = e + (1 - e) * 0.1; // ink never goes below 10% of the color: bold, but colored, lines
+      painted[j] = contrast[(painted[j] * t) | 0];
+      painted[j + 1] = contrast[(painted[j + 1] * t) | 0];
+      painted[j + 2] = contrast[(painted[j + 2] * t) | 0];
+    }
   }
 
   // Faces: refine eyes, brows, lips and nose from the landmarks.
@@ -3674,29 +2671,43 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     painted.set(fctx.getImageData(0, 0, w, h).data);
   }
 
-  // Pen strokes for the live drawing: the ink's center lines.
+  // Pen strokes for the live drawing: the lines' center lines.
   onStatus('Preparing the sketch…');
   await nextFrame();
+  const lineBin = new Uint8Array(n);
+  for (let i = 0; i < n; i++) lineBin[i] = ink[i] < 0.45 || (outline && outline[i] > 0.3) ? 1 : 0;
+  // Grow by 1 pixel to bridge tiny gaps (see Line art), then thin to center lines.
   const bin = new Uint8Array(n);
-  for (let i = 0; i < n; i++) bin[i] = ink[i] < 0.45 || (outline && outline[i] > 0.3) ? 1 : 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      bin[i] = lineBin[i] | lineBin[i - 1] | lineBin[i + 1] | lineBin[i - w] | lineBin[i + w];
+    }
+  }
   thinLines(bin, w, h);
-  let raw = filterAndSimplify(traceContours(bin, w, h), Math.round(10 * scale), SETTINGS.rdpEpsilon);
-  raw = suppressTexture(raw, w, h, { maxDensity: 0.12 });
+  let raw = filterAndSimplify(traceContours(bin, w, h), Math.round((preset.lines === 'pencil' ? 5 : 10) * scale), SETTINGS.rdpEpsilon);
+  raw = suppressTexture(raw, w, h, { maxDensity: preset.lines === 'pencil' ? 0.15 : 0.12 });
   const strokes = finalizeStrokes(raw);
   const outScale = outputScale(w, h);
   for (const s of strokes) {
-    s.outlineWidth = (1.1 + 0.9 * strokeProminence(s)) / outScale;
-    s.outlineColor = '#2a1c16';
-    s.outlineAlpha = 0.9;
+    if (preset.lines === 'pencil') {
+      s.outlineWidth = (1.0 + 0.9 * strokeProminence(s)) / outScale;
+      s.outlineColor = '#3a363a';
+      s.outlineAlpha = 0.8;
+    } else {
+      s.outlineWidth = (1.1 + 0.9 * strokeProminence(s)) / outScale;
+      s.outlineColor = '#2a1c16';
+      s.outlineAlpha = 0.9;
+    }
   }
 
   const { labels: washLabels, centers } = await runPaintStage(painted, w, h, { radii: [], k: 12, maxIter: 10 });
-  const art = makeStorybookArt({
+  const art = makePaintedArt({
     w, h, painted, grain: makePaperGrain(w, h), labels: washLabels, centers,
     customStrokes: strokes, outlineOpacity: 1, faces: faces.length,
   });
-  art.mode = 'illustration';
-  art.linesFirst = true;
+  art.mode = preset.mode;
+  art.linesFirst = true; // sketch first, then color in
   art.linesBaked = true;
   return art;
 }
@@ -4478,7 +3489,7 @@ async function generate() {
       ? await buildLineArt(state.image, detail, onStatus)
       : mode === 'illustration'
         ? await buildIllustration(state.image, detail, onStatus)
-        : await buildCartoonOrFallback(state.image, detail, onStatus);
+        : await buildSketchCartoon(state.image, detail, onStatus);
   } catch (err) {
     console.error(err);
     if (!cancelled()) showEmpty('Something went wrong while processing this photo. Please try a different one.');
