@@ -25,10 +25,11 @@ Being an on-device filter, it won't redraw a photo the way large generative AI i
 1. Edge-aware smoothing (domain transform) removes noise but keeps fine edges.
 2. An *edge tangent flow* field measures which way lines run at every pixel.
 3. The Difference-of-Gaussians ink signal is smoothed *along* that flow, so faint, broken detections (hair strands, fabric folds) join into long, flowing lines.
-4. This runs at two sizes: one for the main contours and a finer one that adds small details (strands of hair, lashes, creases, textures), merged into one drawing.
-5. A third pass looks only inside dark areas (black clothes, dark hair). Their detail sits near the bottom of the lightness scale, where differences are too small to notice, so the darks are stretched (a *gamma* curve, like lifting the shadows in a photo editor) and searched with a more sensitive threshold. That's what brings out the folds and texture of a black dress.
+4. This runs at three sizes: one for the main contours, a finer one for small details (lashes, creases, folds), and a finest one for the tiniest (single hair strands, lace, stitching, fabric texture), merged into one drawing with the finer layers drawn lighter.
+5. Another pass looks only inside dark areas (black clothes, dark hair). Their detail sits near the bottom of the lightness scale, where differences are too small to notice, so the darks are stretched (a *gamma* curve, like lifting the shadows in a photo editor) and searched with a more sensitive threshold. That's what brings out the folds and texture of a black dress.
+6. Faint lines are lifted a little when they're rendered, so fine detail glows visibly instead of fading into the black.
 
-The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, brows, nose and lips. Dark photos are brightened for line finding only.
+The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, eyelid creases, brows, nose, nostrils and lips. Dark photos are brightened for line finding only.
 
 **Cartoon** is a **colored-pencil drawing of your photo**: sketched in graphite the way it really is, then colored in with pencil strokes, the way an artist draws from a reference photo. It runs on the same engine as Illustration with a different recipe (a "preset"):
 
@@ -94,7 +95,7 @@ The sections in `app.js` are:
 
 0. Settings & helpers
 1. **Shared pipeline**: downscale, grayscale, contrast stretch, Gaussian blur, Sobel, non-max suppression, hysteresis threshold, contour tracing, smoothing, RDP simplification, stroke ordering, smooth curves (every style's lines go through the tracing and curve steps to become pen strokes)
-2. **Mode 1: Line art**: two-size flow-based XDoG plus a dark-area pass, glowing ink rendering, the live pen
+2. **Mode 1: Line art**: three-size flow-based XDoG plus a dark-area pass, glowing ink rendering, the live pen
 3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (coloring strokes planned patch by patch, revealed through per-area patterns), the result object
 4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
 4c. **Mode 2: Cartoon** (`buildSketchCartoon`) and the tools it shares with the Illustration: Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, detail restoration, colored-pencil grain and graphite hatching (`hatchLines`, `hatchCoverage`), speck removal, Zhang–Suen thinning (for the live pen), face refinement (`refineFace`), and the shared first and last steps (`preparePhoto`, `finishPaintedArt`)

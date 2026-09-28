@@ -784,8 +784,10 @@ function renderGlowInk(ink, photo, w, h) {
   const R = chan(0), G = chan(1), B = chan(2);
   const lines = new Uint8ClampedArray(n * 4);
   for (let i = 0, j = 0; i < n; i++, j += 4) {
-    const a = 1 - ink[i];
-    if (a < 0.03) continue;
+    // Faint lines are lifted a little (a gentle curve, a^0.75), so fine detail
+    // glows visibly instead of fading into the black.
+    const a = Math.pow(1 - ink[i], 0.75);
+    if (a < 0.05) continue;
     const [r, g, b] = vividRGB(R[i], G[i], B[i]);
     lines[j] = r; lines[j + 1] = g; lines[j + 2] = b; lines[j + 3] = 255 * a;
   }
@@ -947,31 +949,34 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
   }
   const lab = rgbaToLab(lineSource);
   const guide = [new Float32Array(lab.L), lab.A, lab.B];
-  domainTransformSmooth([lab.L], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
+  domainTransformSmooth([lab.L], guide, w, h, 16 * scale, 2.5 + (1 - d) * 5, 3);
   const flow = edgeTangentFlow(lab.L, w, h, 3 * scale);
   // tau = 1 ("pure" difference of Gaussians): only real edges become lines.
-  // (The Illustration uses tau < 1, which also inks very dark areas: good
-  // shading for a painting, but it would flood dark clothes in a line drawing.)
-  const main = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -0.95 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+  // (tau < 1 also inks very dark areas: good shading for a painting, but it
+  // would flood dark clothes in a line drawing.)
+  const main = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -0.85 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
   // A second, finer layer (smaller blur, shorter flow) catches small details:
   // lashes, creases, small folds and texture edges. It's drawn a bit lighter,
   // so the main flowing lines still lead.
-  const fine = xdogLines(lab.L, w, h, 0.6 * scale, { tau: 1, eps: -0.85 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+  const fine = xdogLines(lab.L, w, h, 0.6 * scale, { tau: 1, eps: -0.75 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+  // A third, finest layer for the tiniest details: single hair strands, lace
+  // and stitching, the texture of fabric, drawn lighter still.
+  const finest = xdogLines(lab.L, w, h, 0.42 * scale, { tau: 1, eps: -0.7 + d * 0.6, phi: 2.2, flow: { ...flow, length: 7 * scale } });
   // Dark areas (black clothes, dark hair) keep their detail near the bottom
   // of the lightness scale, where the differences are too small for the ink
-  // threshold to notice. So there's a third pass just for them: stretch the
+  // threshold to notice. So there's another pass just for them: stretch the
   // darks (a "gamma" curve, like lifting the shadows in a photo editor), find
   // lines there with a more sensitive threshold, and use them only where the
   // photo is dark.
   const lifted = Float32Array.from(lab.L, (v) => 100 * Math.pow(clamp(v / 100, 0, 1), 0.5));
   const darkFlow = edgeTangentFlow(lifted, w, h, 3 * scale);
-  const inDark = xdogLines(lifted, w, h, 0.8 * scale, { tau: 1, eps: (-1.0 + d * 0.7) * 0.45, phi: 2.2, flow: { ...darkFlow, length: 12 * scale } });
+  const inDark = xdogLines(lifted, w, h, 0.7 * scale, { tau: 1, eps: (-1.0 + d * 0.7) * 0.38, phi: 2.2, flow: { ...darkFlow, length: 12 * scale } });
   const ink = new Float32Array(w * h);
   for (let i = 0; i < ink.length; i++) {
-    const darkness = smoothstep(42, 18, lab.L[i]);
-    ink[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.85, 1 - (1 - inDark[i]) * darkness * 0.9);
+    const darkness = smoothstep(45, 18, lab.L[i]);
+    ink[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.85, 1 - (1 - finest[i]) * 0.6, 1 - (1 - inDark[i]) * darkness);
   }
-  removeInkSpecks(ink, w, h, Math.round(5 * scale * scale));
+  removeInkSpecks(ink, w, h, Math.round(3 * scale * scale));
   // Grow the ink by 1 pixel before thinning ("dilation"): it bridges tiny
   // 1–2 px gaps, so a hair strand that the ink broke into dashes becomes one
   // continuous line again.
@@ -1599,8 +1604,19 @@ function addLandmarkFeatureLines(raw, faces) {
       ring(LM.lipsOuter, pts), ring(LM.lipsInner, pts),
       pick(pts, [168, 6, 197, 195, 5]),                                             // nose bridge
       pick(pts, [98, 97, 2, 326, 327]),                                             // underside of the nose
+      pick(pts, [48, 64, 98, 97]), pick(pts, [278, 294, 327, 326]),                 // nostril wings
       ring(LM.faceOval, pts),
     ];
+    // Eyelid creases: a curve above each upper lid, about a third of the way
+    // up to the brow, lifted most in the middle.
+    for (const [eyeIdx, browIdx] of [[LM.rightEye, LM.rightBrow], [LM.leftEye, LM.leftBrow]]) {
+      const eye = pick(pts, eyeIdx), mid = centroid(eye), brow = centroid(pick(pts, browIdx));
+      const ux = brow.x - mid.x, uy = brow.y - mid.y;
+      lines.push(eye.slice(1, 8).map((p, k) => {
+        const lift = 0.2 + 0.14 * Math.sin((k / 6) * Math.PI);
+        return { x: p.x + ux * lift, y: p.y + uy * lift };
+      }));
+    }
     // Irises: circles through the iris landmarks.
     for (const [center, edge] of [[LM.rightIris, LM.rightIrisEdge], [LM.leftIris, LM.leftIrisEdge]]) {
       const c = pts[center];
