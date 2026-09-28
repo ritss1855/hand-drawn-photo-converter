@@ -53,8 +53,13 @@ The *Edge detail* slider controls how many pencil lines appear and how flat the 
 Turn on **Show it drawn out live** to watch the picture being made (and save it as a video):
 
 - **Line art:** a glowing pen traces every line, then the full-detail ink fades in.
-- **Cartoon and Illustration:** first a pencil sketches the whole drawing on blank paper, including the face's features. Then it's **colored in stroke by stroke**, like someone coloring a sketch: back-and-forth hatching strokes fill the picture patch by patch, skin first, then hair, clothes, and the background last. Each area is colored inside its own lines. Every coloring stroke reveals the finished picture underneath, so the last frame is exactly the final image.
-- **Drawing speed** goes from **0.25x** (4 times slower) to **2x**. At 1x, Line art takes about 8 s, and Cartoon and Illustration about 12 s (they're sketched and then colored). At 0.25x that becomes 32 s and 48 s.
+- **Cartoon and Illustration:** first a pencil sketches the whole drawing on blank paper, including the face's features. Then it's **colored in by hand**, the way you'd color a sketch with colored pencils: skin first, then hair, clothes, and the background last, each area inside its own lines. Every area is colored in layers:
+  1. a first, light layer of thin diagonal hatching, with paper still showing between the strokes;
+  2. a second layer of strokes crossing it (cross-hatching);
+  3. filling in with wider, overlapping strokes until the color is solid.
+
+  The strokes go back and forth across the area patch by patch, with a grainy colored-pencil texture, so the color builds up gradually instead of popping in. Each stroke reveals the finished picture underneath, so the last frame is exactly the final image.
+- **Drawing speed** goes from **0.1x** (10 times slower) to **2x**. At 1x, Line art takes about 8 s, and Cartoon and Illustration about 16 s (they're sketched and then colored in). At 0.1x that becomes about 80 s and 160 s.
 
 | Library / model | Size | Source | License |
 | --- | --- | --- | --- |

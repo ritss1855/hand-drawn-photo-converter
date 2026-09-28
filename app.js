@@ -1167,31 +1167,45 @@ function drawPaintedFinal(ctx, art) {
 }
 
 /**
+ * How a person colors an area in with colored pencils: in layers, each one
+ * covering the whole area before the next starts.
+ *   1. A first, light layer of hatching: thin strokes, with the paper still
+ *      showing between them.
+ *   2. A second layer crossing it at another angle ("cross-hatching").
+ *   3. Filling in: wider, overlapping strokes until the color is solid.
+ * angle: turn from the patch's hatch direction (radians); spacing and width:
+ * multiples of the area's stroke spacing; alpha: how much color one stroke
+ * lays down.
+ */
+const COLORING_LAYERS = [
+  { angle: 0, spacing: 1, width: 0.5, alpha: 0.75 },
+  { angle: 1.15, spacing: 1, width: 0.5, alpha: 0.8 },
+  { angle: 0.55, spacing: 0.8, width: 1.35, alpha: 1 },
+];
+
+/**
  * Coloring-in strokes for the live drawing: back-and-forth hatching that
- * covers the whole picture patch by patch, the way a person colors in a
- * sketch. `regions` gives each pixel an area number (0, 1, 2, … = the order
- * they're colored in, e.g. skin, hair, clothes, then the background), and
- * `spacings[r]` is the gap between neighboring strokes in area r.
- *   - Each area is split into square patches, visited row by row in a
- *     snake order (left→right, then right→left), like a hand moving across.
- *   - In a patch, parallel hatch lines run at about 60° (the same direction
- *     as the picture's pencil hatching), a little different per patch.
- *     Where a line crosses the area, it becomes part of the stroke; the
- *     stroke zig-zags back and forth from line to line, and lifts off when
- *     the next piece is far away.
- * Strokes are drawn with a width of about twice the spacing, so neighbors
- * overlap and together they cover every pixel. Returns pen strokes
- * ({ points, segs, length, width, region }) in coloring order.
+ * covers the whole picture, the way a person colors in a sketch. `regions`
+ * gives each pixel an area number (0, 1, 2, … = the order they're colored
+ * in, e.g. skin, hair, clothes, then the background), and `spacings[r]` is
+ * the gap between neighboring strokes in area r.
+ *   - Each area is colored in the layers of COLORING_LAYERS.
+ *   - For a layer, the area is split into square patches, visited row by
+ *     row in a snake order (left→right, then right→left), like a hand
+ *     moving across. The next layer starts where the last one stopped, and
+ *     each layer's patch grid is shifted, so the patch edges don't show.
+ *   - All hatch lines of a layer run in one direction (about 60°, the same
+ *     as the picture's pencil hatching, turned per layer) on one shared set
+ *     of evenly spaced lines, so they continue straight across patch edges.
+ *     Where a line crosses the patch and the area, that piece is one pencil
+ *     stroke; strokes go back and forth from line to line.
+ * Returns pen strokes ({ points, segs, length, width, alpha, region }) in
+ * coloring order.
  */
 function coloringStrokes(regions, spacings, w, h, scale) {
   const strokes = [];
-  const patch = Math.round(150 * scale);
-  let region = 0;
-  const flush = (path, width) => {
-    if (path.length >= 2) strokes.push({ points: path, width, region });
-  };
+  const patch = Math.round(220 * scale);
   for (let r = 0; r < spacings.length; r++) {
-    region = r;
     let x0 = w, y0 = h, x1 = -1, y1 = -1;
     for (let y = 0; y < h; y += 2) {
       for (let x = 0; x < w; x += 2) {
@@ -1200,44 +1214,61 @@ function coloringStrokes(regions, spacings, w, h, scale) {
       }
     }
     if (x1 < 0) continue;
-    const gap = spacings[r], width = gap * 2.1;
-    const rows = Math.ceil((y1 - y0 + 1) / patch), cols = Math.ceil((x1 - x0 + 1) / patch);
-    for (let py = 0; py < rows; py++) {
-      for (let k = 0; k < cols; k++) {
-        const px = py % 2 ? cols - 1 - k : k; // snake order
-        const bx0 = x0 + px * patch, by0 = y0 + py * patch;
-        const bx1 = Math.min(w, bx0 + patch), by1 = Math.min(h, by0 + patch);
-        const angle = -Math.PI / 3 + (hash2(px + 31 * r, py) - 0.5) * 0.35;
-        const dx = Math.cos(angle), dy = Math.sin(angle), nx = -dy, ny = dx;
-        const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2, half = Math.hypot(bx1 - bx0, by1 - by0) / 2;
-        const at = (v, u) => ({ x: cx + nx * v + dx * u, y: cy + ny * v + dy * u });
-        let path = [], last = null, forward = true;
-        for (let v = -half + gap / 2; v <= half; v += gap) {
+
+    COLORING_LAYERS.forEach((layer, li) => {
+      const gap = spacings[r] * layer.spacing, width = spacings[r] * layer.width;
+      const flush = (path) => { if (path.length >= 2) strokes.push({ points: path, width, alpha: layer.alpha, region: r }); };
+      // This layer's patch grid, shifted by a third of a patch per layer.
+      const shift = ((li * patch) / 3) | 0;
+      const gx0 = x0 - shift, gy0 = y0 - shift;
+      const rows = Math.ceil((y1 - gy0 + 1) / patch), cols = Math.ceil((x1 - gx0 + 1) / patch);
+      const order = [];
+      for (let py = 0; py < rows; py++) for (let k = 0; k < cols; k++) order.push([py % 2 ? cols - 1 - k : k, py]);
+      if (li % 2) order.reverse();
+      // Direction along the strokes (dx, dy) and across them (nx, ny).
+      const angle = -Math.PI / 3 + layer.angle + (hash2(r, li) - 0.5) * 0.2;
+      const dx = Math.cos(angle), dy = Math.sin(angle), nx = -dy, ny = dx;
+      const at = (v, u) => ({ x: nx * v + dx * u, y: ny * v + dy * u });
+      for (const [px, py] of order) {
+        const bx0 = Math.max(0, gx0 + px * patch), by0 = Math.max(0, gy0 + py * patch);
+        const bx1 = Math.min(w, gx0 + (px + 1) * patch), by1 = Math.min(h, gy0 + (py + 1) * patch);
+        if (bx1 <= bx0 || by1 <= by0) continue;
+        // The ranges of "across" (v) and "along" (u) positions this patch covers.
+        let vMin = Infinity, vMax = -Infinity, uMin = Infinity, uMax = -Infinity;
+        for (const [cx, cy] of [[bx0, by0], [bx1, by0], [bx0, by1], [bx1, by1]]) {
+          const v = cx * nx + cy * ny, u = cx * dx + cy * dy;
+          vMin = Math.min(vMin, v); vMax = Math.max(vMax, v); uMin = Math.min(uMin, u); uMax = Math.max(uMax, u);
+        }
+        let forward = true;
+        for (let v = (Math.floor(vMin / gap) + 0.5) * gap; v <= vMax; v += gap) {
           // The pieces of this hatch line that lie inside the patch AND the area.
           const runs = [];
           let start = null;
-          for (let u = -half; u <= half + 2; u += 2) {
+          for (let u = uMin; u <= uMax + 2; u += 2) {
             const p = at(v, u), xi = Math.round(p.x), yi = Math.round(p.y);
-            const inside = u <= half && xi >= bx0 && xi < bx1 && yi >= by0 && yi < by1 && regions[yi * w + xi] === r;
+            const inside = u <= uMax && xi >= bx0 && xi < bx1 && yi >= by0 && yi < by1 && regions[yi * w + xi] === r;
             if (inside && start === null) start = u;
             if (!inside && start !== null) { runs.push([start, u - 2]); start = null; }
           }
           if (!forward) { runs.reverse(); for (const run of runs) run.reverse(); }
           for (const [ua, ub] of runs) {
-            const a = at(v, ua), b = at(v, ub);
-            if (last && dist(last, a) > gap * 3) { flush(path, width); path = []; }
-            // Each point twice: the smooth-curve builder then passes exactly
-            // through it (a hand scribbling back and forth has sharp turns).
+            // One pencil stroke per piece, going back and forth from line to
+            // line (the pencil lifts at each end, so no seams are drawn along
+            // the patch edges). Its ends reach a random bit past the piece, so
+            // strokes of neighboring patches overlap unevenly, like real
+            // hatching (past the area's own edge, the pattern hides them).
             // A slightly offset middle point makes the stroke a little curved.
+            const dir = ub >= ua ? 1 : -1;
+            const ka = Math.round(v * 7 + ua), kb = Math.round(v * 5 + ub);
+            const a = at(v, ua - dir * gap * (0.2 + hash2(ka, 3 + li))), b = at(v, ub + dir * gap * (0.2 + hash2(kb, 5 + li)));
             const mid = at(v + (hash2(Math.round(v), Math.round(ua)) - 0.5) * gap * 0.5, (ua + ub) / 2);
-            path.push(a, a, mid, b, b);
-            last = b;
+            // Each end point twice: the smooth-curve builder then passes exactly through it.
+            flush([a, a, mid, b, b]);
           }
           forward = !forward;
         }
-        flush(path, width);
       }
-    }
+    });
   }
   for (const s of strokes) {
     s.segs = buildSegments(s.points);
@@ -1248,9 +1279,10 @@ function coloringStrokes(regions, spacings, w, h, scale) {
 
 /**
  * Live version, drawn the way an artist works: first the pen sketches the
- * lines on blank paper (40% of the time), then the picture is colored in
- * with back-and-forth strokes (art.colorStrokes), area by area, each stroke
- * revealing the finished colors underneath.
+ * lines on blank paper (30% of the time), then the picture is colored in by
+ * hand with back-and-forth pencil strokes (art.colorStrokes), area by area
+ * and layer by layer (see COLORING_LAYERS), each stroke revealing the
+ * finished colors underneath. The last frame is exactly the finished picture.
  */
 function createPaintedDrawer(ctx, art) {
   const layer = makeCanvas(ctx.canvas.width, ctx.canvas.height);
@@ -1259,15 +1291,21 @@ function createPaintedDrawer(ctx, art) {
   const pen = createStrokePen(art.strokes, styleOutline);
   const paper = makeCanvas(art.width, art.height);
   paper.getContext('2d').putImageData(new ImageData(art.paper, art.width, art.height), 0, 0);
-  const lineShare = art.strokes.length ? 0.4 : 0;
+  const lineShare = art.strokes.length ? 0.3 : 0;
 
   // The coloring layer: each coloring stroke is painted with a "pattern"
   // made of the finished picture, so wherever a stroke passes, the finished
   // colors (and their pencil texture) appear, stroke by stroke. Each area
-  // gets its own pattern that is see-through outside the area (grown by 1
-  // pixel so no seams are left), so strokes color inside the lines, like a
-  // careful artist. The layer's transform scales processing pixels to the
-  // output, exactly like drawing the finished picture, so they line up.
+  // gets its own patterns, see-through outside the area (grown by 1 pixel so
+  // no seams are left), so strokes color inside the lines, like a careful
+  // artist. The first layers use a grainy see-through version, like a
+  // colored pencil catching only the bumps of the paper: a stroke leaves
+  // speckled, partial color that builds up as strokes overlap. The last,
+  // filling-in layer uses a solid one, so the color ends up exactly finished.
+  // (An area's patterns are made when its coloring starts, and dropped when
+  // it's done, to save memory.) The layer's transform scales processing
+  // pixels to the output, exactly like drawing the finished picture, so
+  // they line up.
   const colorLayer = makeCanvas(ctx.canvas.width, ctx.canvas.height);
   const cctx = colorLayer.getContext('2d');
   cctx.setTransform(art.scale, 0, 0, art.scale, 0, 0);
@@ -1275,22 +1313,36 @@ function createPaintedDrawer(ctx, art) {
   cctx.lineJoin = 'round';
   cctx.imageSmoothingQuality = 'high';
   const { width: w, height: h } = art;
-  const patterns = [];
-  for (let r = 0; r < art.colorRegionCount; r++) {
-    const px = new Uint8ClampedArray(art.painted);
+  let tooth = new Float32Array(w * h);
+  for (let i = 0; i < tooth.length; i++) tooth[i] = Math.random();
+  tooth = gaussianBlurSigma(tooth, w, h, 0.6);
+  let current = { region: -1 };
+  const patternsFor = (r) => {
+    if (current.region === r) return current;
     const reg = art.colorRegions;
+    const grainy = new Uint8ClampedArray(art.painted), solid = new Uint8ClampedArray(art.painted);
     for (let y = 0, i = 0; y < h; y++) {
       for (let x = 0; x < w; x++, i++) {
         const inside = reg[i] === r || (x > 0 && reg[i - 1] === r) || (x < w - 1 && reg[i + 1] === r) ||
           (y > 0 && reg[i - w] === r) || (y < h - 1 && reg[i + w] === r);
-        if (!inside) px[i * 4 + 3] = 0;
+        grainy[i * 4 + 3] = inside ? 255 * clamp(0.62 + (tooth[i] - 0.5) * 1.5, 0.3, 1) : 0;
+        solid[i * 4 + 3] = inside ? 255 : 0;
       }
     }
-    const c = makeCanvas(w, h);
-    c.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0);
-    patterns.push(cctx.createPattern(c, 'no-repeat'));
-  }
-  const colorPen = createStrokePen(art.colorStrokes, (c, s) => { c.strokeStyle = patterns[s.region]; c.lineWidth = s.width; });
+    const toPattern = (px) => {
+      const c = makeCanvas(w, h);
+      c.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0);
+      return cctx.createPattern(c, 'no-repeat');
+    };
+    current = { region: r, grainy: toPattern(grainy), solid: toPattern(solid) };
+    return current;
+  };
+  const colorPen = createStrokePen(art.colorStrokes, (c, s) => {
+    const p = patternsFor(s.region);
+    c.strokeStyle = s.alpha < 1 ? p.grainy : p.solid;
+    c.lineWidth = s.width;
+    c.globalAlpha = s.alpha;
+  });
 
   let sketch = null; // paper + the finished sketch, made once the pen is done
   return (progress) => {
@@ -2667,7 +2719,7 @@ function finishPaintedArt({ w, h, scale, painted, ink, outline, lineCut, pen, pe
     colorStrokes: coloringStrokes(regions, spacings, w, h, scale), colorRegions: regions, colorRegionCount: spacings.length,
   });
   art.mode = mode;
-  art.durationScale = 1.5; // two stages (sketching, then coloring), so it takes a bit longer
+  art.durationScale = 2; // two stages (sketching, then coloring in by hand), so it takes longer
   return art;
 }
 
@@ -4003,9 +4055,10 @@ async function generate() {
     ui.status.textContent = 'Drawing…';
     state.song = musicChoice !== 'none' ? startSelectedSong(musicChoice) : null;
 
-    // Line art takes ~8 s at 1x (Cartoon and Illustration 1.5× that, since
-    // they're sketched and then colored in); 2x speed halves it, 0.25x takes
-    // 4 times as long. The pen's pace is derived from the total work inside drawAt.
+    // Line art takes ~8 s at 1x (Cartoon and Illustration twice that, since
+    // they're sketched and then colored in by hand); 2x speed halves it, 0.1x
+    // takes 10 times as long. The pen's pace is derived from the total work
+    // inside drawAt.
     const duration = (SETTINGS.baseDurationMs * (art.durationScale || 1)) / speed;
     const finished = await animateDrawing(drawAt, duration, (p) => { ui.progressBar.style.width = `${p * 100}%`; }, cancelled);
     if (!finished) return;
