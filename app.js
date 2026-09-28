@@ -18,7 +18,6 @@
      3. PAINTING HELPERS     (paper, the "sketch first, then color it in"
                                live drawing, and the result object for
                                Cartoon and Illustration)
-     4. WEB WORKER HELPER    (runs the heavy k-means step off the main thread)
      4b. FACE & BODY FINDER  (MediaPipe person/hair/skin segmentation and the
                                478 face landmarks, plus small geometry helpers)
      4c. MODES 2 & 3: CARTOON AND ILLUSTRATION
@@ -951,14 +950,26 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
   // tau = 1 ("pure" difference of Gaussians): only real edges become lines.
   // (The Illustration uses tau < 1, which also inks very dark areas: good
   // shading for a painting, but it would flood dark clothes in a line drawing.)
-  const main = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -1.1 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+  const main = xdogLines(lab.L, w, h, 1.0 * scale, { tau: 1, eps: -0.95 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
   // A second, finer layer (smaller blur, shorter flow) catches small details:
   // lashes, creases, small folds and texture edges. It's drawn a bit lighter,
   // so the main flowing lines still lead.
-  const fine = xdogLines(lab.L, w, h, 0.6 * scale, { tau: 1, eps: -1.0 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+  const fine = xdogLines(lab.L, w, h, 0.6 * scale, { tau: 1, eps: -0.85 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+  // Dark areas (black clothes, dark hair) keep their detail near the bottom
+  // of the lightness scale, where the differences are too small for the ink
+  // threshold to notice. So there's a third pass just for them: stretch the
+  // darks (a "gamma" curve, like lifting the shadows in a photo editor), find
+  // lines there with a more sensitive threshold, and use them only where the
+  // photo is dark.
+  const lifted = Float32Array.from(lab.L, (v) => 100 * Math.pow(clamp(v / 100, 0, 1), 0.5));
+  const darkFlow = edgeTangentFlow(lifted, w, h, 3 * scale);
+  const inDark = xdogLines(lifted, w, h, 0.8 * scale, { tau: 1, eps: (-1.0 + d * 0.7) * 0.45, phi: 2.2, flow: { ...darkFlow, length: 12 * scale } });
   const ink = new Float32Array(w * h);
-  for (let i = 0; i < ink.length; i++) ink[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.75);
-  removeInkSpecks(ink, w, h, Math.round(6 * scale * scale));
+  for (let i = 0; i < ink.length; i++) {
+    const darkness = smoothstep(42, 18, lab.L[i]);
+    ink[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.85, 1 - (1 - inDark[i]) * darkness * 0.9);
+  }
+  removeInkSpecks(ink, w, h, Math.round(5 * scale * scale));
   // Grow the ink by 1 pixel before thinning ("dilation"): it bridges tiny
   // 1–2 px gaps, so a hair strand that the ink broke into dashes becomes one
   // continuous line again.
@@ -1041,207 +1052,15 @@ async function buildLineArt(image, detail, onStatus = () => {}) {
    -----------------------------------------------------------------------------
    Section 4c makes the finished picture. This section turns it into a live
    drawing, the way an artist works: the pen sketches the lines on blank
-   paper first, then the colors are washed in, region by region.
-     - k-means groups the finished picture's pixels into 12 color regions,
-       and computeRevealOrder() decides when each pixel gets its color.
+   paper first, then the picture is colored in with back-and-forth strokes,
+   area by area.
      - makePaperGrain() / composePaper(): the textured blank paper.
+     - coloringStrokes(): plans the coloring-in strokes.
+     - createPaintedDrawer(): plays the sketching and the coloring.
      - makePaintedArt() packages everything into the result object.
-   (Kuwahara is the "oil paint" smoother. paintStage() can run it before
-   k-means; the current styles skip it because 4c already smooths the photo.)
-
-   NOTE: kuwaharaFilter, kmeansPlusPlusInit, kmeansQuantize and paintStage are
-   copied into a Web Worker as text (see section 4), so they must be fully
-   self-contained: they can't use helpers or constants from outside themselves.
+   Plus makeLevelsLut() / applyLut(), the "auto levels" brightening that
+   dark photos get.
    ============================================================================= */
-
-/**
- * Kuwahara filter — the "oil paint" smoother.
- * A normal blur smears across edges. Kuwahara flattens texture but keeps
- * edges sharp, which is exactly how painted regions look.
- *
- * For each pixel, look at 4 overlapping square windows around it (top-left,
- * top-right, bottom-left, bottom-right). Measure how "busy" each window is
- * (the variance of brightness). Take the average color of the CALMEST window.
- * Near an edge, the calmest window is the one entirely on one side of the
- * edge, so the pixel copies that side and the edge stays crisp.
- *
- * Speed trick: "summed-area tables" (integral images). S[y][x] holds the sum of
- * all pixels above-left of (x, y), so the sum of ANY rectangle takes just 4
- * lookups. That makes the window size free: O(1) per window instead of O(r²).
- */
-function kuwaharaFilter(rgba, w, h, radius) {
-  const W1 = w + 1, size = W1 * (h + 1);
-  const sR = new Float64Array(size), sG = new Float64Array(size), sB = new Float64Array(size);
-  const sL = new Float64Array(size), sL2 = new Float64Array(size);
-
-  // Build the summed-area tables (one row at a time with running row sums).
-  for (let y = 0; y < h; y++) {
-    let rR = 0, rG = 0, rB = 0, rL = 0, rL2 = 0;
-    for (let x = 0; x < w; x++) {
-      const j = (y * w + x) * 4;
-      const r = rgba[j], g = rgba[j + 1], b = rgba[j + 2];
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      rR += r; rG += g; rB += b; rL += lum; rL2 += lum * lum;
-      const k = (y + 1) * W1 + (x + 1), up = k - W1;
-      sR[k] = sR[up] + rR; sG[k] = sG[up] + rG; sB[k] = sB[up] + rB;
-      sL[k] = sL[up] + rL; sL2[k] = sL2[up] + rL2;
-    }
-  }
-
-  // Sum of table S over the inclusive rectangle x0..x1, y0..y1.
-  const rect = (S, x0, y0, x1, y1) =>
-    S[(y1 + 1) * W1 + (x1 + 1)] - S[y0 * W1 + (x1 + 1)] - S[(y1 + 1) * W1 + x0] + S[y0 * W1 + x0];
-
-  const out = new Uint8ClampedArray(rgba.length);
-  for (let y = 0; y < h; y++) {
-    const yTop = Math.max(0, y - radius), yBot = Math.min(h - 1, y + radius);
-    for (let x = 0; x < w; x++) {
-      const xL = Math.max(0, x - radius), xR = Math.min(w - 1, x + radius);
-      // The 4 windows as [x0, y0, x1, y1]
-      const windows = [
-        [xL, yTop, x, y], [x, yTop, xR, y],
-        [xL, y, x, yBot], [x, y, xR, yBot],
-      ];
-      let bestVar = Infinity, best = windows[0], bestN = 1;
-      for (const win of windows) {
-        const n = (win[2] - win[0] + 1) * (win[3] - win[1] + 1);
-        const mean = rect(sL, win[0], win[1], win[2], win[3]) / n;
-        const variance = rect(sL2, win[0], win[1], win[2], win[3]) / n - mean * mean; // Var = E[X²] − E[X]²
-        if (variance < bestVar) { bestVar = variance; best = win; bestN = n; }
-      }
-      const j = (y * w + x) * 4;
-      out[j] = rect(sR, best[0], best[1], best[2], best[3]) / bestN;
-      out[j + 1] = rect(sG, best[0], best[1], best[2], best[3]) / bestN;
-      out[j + 2] = rect(sB, best[0], best[1], best[2], best[3]) / bestN;
-      out[j + 3] = 255;
-    }
-  }
-  return out;
-}
-
-/**
- * k-means++ initialization.
- * k-means needs k starting "guess" colors. Random picks often land several
- * guesses in the same area (e.g. all in the sky), giving a poor palette.
- * k-means++ spreads them out: the first is random; each next one is chosen
- * with probability proportional to its squared distance from the nearest
- * already-chosen center, so far-away (different) colors are favored.
- * `samples` is a flat array [r,g,b, r,g,b, ...] of n colors.
- */
-function kmeansPlusPlusInit(samples, n, k) {
-  const centers = new Float64Array(k * 3);
-  const first = Math.floor(Math.random() * n);
-  centers[0] = samples[first * 3]; centers[1] = samples[first * 3 + 1]; centers[2] = samples[first * 3 + 2];
-
-  const nearest = new Float64Array(n).fill(Infinity); // squared distance to the closest chosen center
-  for (let c = 1; c < k; c++) {
-    const pr = centers[(c - 1) * 3], pg = centers[(c - 1) * 3 + 1], pb = centers[(c - 1) * 3 + 2];
-    let total = 0;
-    for (let i = 0; i < n; i++) {
-      const dr = samples[i * 3] - pr, dg = samples[i * 3 + 1] - pg, db = samples[i * 3 + 2] - pb;
-      const d = dr * dr + dg * dg + db * db;
-      if (d < nearest[i]) nearest[i] = d;
-      total += nearest[i];
-    }
-    let pick = Math.floor(Math.random() * n);
-    if (total > 0) {
-      let target = Math.random() * total;
-      for (let i = 0; i < n; i++) {
-        target -= nearest[i];
-        if (target <= 0) { pick = i; break; }
-      }
-    }
-    centers[c * 3] = samples[pick * 3];
-    centers[c * 3 + 1] = samples[pick * 3 + 1];
-    centers[c * 3 + 2] = samples[pick * 3 + 2];
-  }
-  return centers;
-}
-
-/**
- * k-means color quantization — choose a small "paint box" of k colors.
- * Real illustrators use a limited palette; flat areas of shared color are a
- * big part of the anime-film look.
- *
- * k-means repeats two steps until the colors stop moving (or maxIter):
- *   1. ASSIGN: each pixel joins the cluster whose center color is nearest
- *      (distance in RGB space, like distance between points in 3D).
- *   2. UPDATE: each center moves to the average color of its members.
- * For speed we learn the palette from ~20,000 sample pixels, then map EVERY
- * pixel to its nearest palette color at the end.
- * Returns { labels (cluster index per pixel), centers (flat k*3 array) }.
- */
-function kmeansQuantize(rgba, w, h, k, maxIter) {
-  const total = w * h;
-  const step = Math.max(1, Math.floor(total / 20000));
-  const n = Math.floor((total - 1) / step) + 1;
-  const samples = new Float64Array(n * 3);
-  for (let s = 0, p = 0; s < n; s++, p += step) {
-    samples[s * 3] = rgba[p * 4]; samples[s * 3 + 1] = rgba[p * 4 + 1]; samples[s * 3 + 2] = rgba[p * 4 + 2];
-  }
-
-  const centers = kmeansPlusPlusInit(samples, n, k);
-  const sums = new Float64Array(k * 3);
-  const counts = new Uint32Array(k);
-
-  for (let iter = 0; iter < maxIter; iter++) {
-    sums.fill(0);
-    counts.fill(0);
-    // 1. Assign each sample to its nearest center
-    for (let i = 0; i < n; i++) {
-      const r = samples[i * 3], g = samples[i * 3 + 1], b = samples[i * 3 + 2];
-      let best = 0, bestD = Infinity;
-      for (let c = 0; c < k; c++) {
-        const dr = r - centers[c * 3], dg = g - centers[c * 3 + 1], db = b - centers[c * 3 + 2];
-        const d = dr * dr + dg * dg + db * db;
-        if (d < bestD) { bestD = d; best = c; }
-      }
-      sums[best * 3] += r; sums[best * 3 + 1] += g; sums[best * 3 + 2] += b;
-      counts[best]++;
-    }
-    // 2. Move each center to the average of its members
-    let maxShift = 0;
-    for (let c = 0; c < k; c++) {
-      if (counts[c] === 0) {
-        // An empty cluster is useless: restart it at a random sample.
-        const p = Math.floor(Math.random() * n);
-        centers[c * 3] = samples[p * 3]; centers[c * 3 + 1] = samples[p * 3 + 1]; centers[c * 3 + 2] = samples[p * 3 + 2];
-        maxShift = Infinity;
-        continue;
-      }
-      const nr = sums[c * 3] / counts[c], ng = sums[c * 3 + 1] / counts[c], nb = sums[c * 3 + 2] / counts[c];
-      const shift = Math.hypot(nr - centers[c * 3], ng - centers[c * 3 + 1], nb - centers[c * 3 + 2]);
-      if (shift > maxShift) maxShift = shift;
-      centers[c * 3] = nr; centers[c * 3 + 1] = ng; centers[c * 3 + 2] = nb;
-    }
-    if (maxShift < 1) break; // converged: colors moved less than 1 level
-  }
-
-  // Map every pixel to its nearest palette color
-  const labels = new Uint8Array(total);
-  for (let p = 0; p < total; p++) {
-    const r = rgba[p * 4], g = rgba[p * 4 + 1], b = rgba[p * 4 + 2];
-    let best = 0, bestD = Infinity;
-    for (let c = 0; c < k; c++) {
-      const dr = r - centers[c * 3], dg = g - centers[c * 3 + 1], db = b - centers[c * 3 + 2];
-      const d = dr * dr + dg * dg + db * db;
-      if (d < bestD) { bestD = d; best = c; }
-    }
-    labels[p] = best;
-  }
-  return { labels, centers };
-}
-
-/**
- * The heavy painting step, grouped so it can run in a Web Worker:
- * optional Kuwahara passes (opts.radii), then k-means on the result.
- */
-function paintStage(rgba, w, h, opts) {
-  let smoothed = rgba;
-  for (let i = 0; i < opts.radii.length; i++) smoothed = kuwaharaFilter(smoothed, w, h, opts.radii[i]);
-  const km = kmeansQuantize(smoothed, w, h, opts.k, opts.maxIter);
-  return { smoothed, labels: km.labels, centers: km.centers };
-}
 
 /** Apply a 256-entry look-up table to the R, G and B of every pixel (in place). */
 function applyLut(rgba, lut) {
@@ -1311,72 +1130,6 @@ function composePaper(grain, w, h) {
 }
 
 /**
- * For the live animation: WHEN each pixel gets painted, as a number 0–1.
- * Clusters are painted lightest first (like watercolor: light washes, then
- * darker layers). Inside a cluster, paint spreads outward from the cluster's
- * center, with noise added so the wash edge looks ragged and organic.
- * Clusters overlap in time so it flows instead of stepping.
- */
-function computeRevealOrder(labels, palette, w, h) {
-  const k = palette.length;
-  const lum = palette.map(([r, g, b]) => 0.299 * r + 0.587 * g + 0.114 * b);
-  const order = lum.map((_, i) => i).sort((a, b) => lum[b] - lum[a]);
-  const rank = new Float32Array(k);
-  order.forEach((c, r) => { rank[c] = r; });
-
-  // Center of mass of each cluster
-  const sx = new Float64Array(k), sy = new Float64Array(k), cnt = new Float64Array(k);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const c = labels[y * w + x];
-      sx[c] += x; sy[c] += y; cnt[c]++;
-    }
-  }
-  for (let c = 0; c < k; c++) { if (cnt[c]) { sx[c] /= cnt[c]; sy[c] /= cnt[c]; } }
-
-  // Distance of each pixel from its cluster's center, and the max per cluster
-  const dist = new Float32Array(w * h);
-  const maxD = new Float32Array(k);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x, c = labels[i];
-      const d = Math.hypot(x - sx[c], y - sy[c]);
-      dist[i] = d;
-      if (d > maxD[c]) maxD[c] = d;
-    }
-  }
-
-  const noise = makeValueNoise(w, h, 24);
-  const span = 0.3; // each cluster's wash takes 30% of the paint phase
-  const spacing = k > 1 ? (1 - span) / (k - 1) : 0;
-  const reveal = new Float32Array(w * h);
-  for (let i = 0; i < reveal.length; i++) {
-    const c = labels[i];
-    const local = 0.65 * (dist[i] / (maxD[c] || 1)) + 0.35 * noise[i];
-    reveal[i] = rank[c] * spacing + local * span;
-  }
-  return reveal;
-}
-
-/**
- * Paint the "wash" frame for paint-phase progress q (0–1): each pixel fades
- * from paper to its final color over a short window around its reveal time.
- */
-const WASH_FADE = 0.06;
-function renderPaintWash(frame, painted, paper, reveal, q) {
-  const p = q * (1 + WASH_FADE);
-  const d = frame.data;
-  for (let i = 0, j = 0; i < reveal.length; i++, j += 4) {
-    let a = (p - reveal[i]) / WASH_FADE;
-    a = a < 0 ? 0 : a > 1 ? 1 : a;
-    d[j] = paper[j] + (painted[j] - paper[j]) * a;
-    d[j + 1] = paper[j + 1] + (painted[j + 1] - paper[j + 1]) * a;
-    d[j + 2] = paper[j + 2] + (painted[j + 2] - paper[j + 2]) * a;
-    d[j + 3] = 255;
-  }
-}
-
-/**
  * Outline style. Major contours get thicker lines (like pressing harder),
  * small details stay fine. `outlineWidth` (in processing pixels) and the
  * optional `outlineColor` / `outlineAlpha` are set when the strokes are built;
@@ -1404,89 +1157,168 @@ function compositePainted(ctx, paintSource, outlineLayer, opacity) {
   ctx.globalAlpha = 1;
 }
 
+/** The finished picture (its lines are already drawn into it), scaled to the canvas. */
 function drawPaintedFinal(ctx, art) {
-  if (art.linesBaked) {
-    // Cartoon and Illustration already have their lines inside the painting.
-    resetCtx(ctx);
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(art.paintCanvas, 0, 0, ctx.canvas.width, ctx.canvas.height);
-    return;
-  }
-  const layer = makeCanvas(ctx.canvas.width, ctx.canvas.height);
-  const lctx = layer.getContext('2d');
-  setStrokeTransform(lctx, art.scale);
-  for (const s of art.strokes) {
-    styleOutline(lctx, s);
-    lctx.beginPath();
-    drawSmoothPath(lctx, s.segs);
-    lctx.stroke();
-  }
-  compositePainted(ctx, art.paintCanvas, layer, art.outlineOpacity);
+  resetCtx(ctx);
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(art.paintCanvas, 0, 0, ctx.canvas.width, ctx.canvas.height);
 }
 
 /**
- * Live version. With art.linesFirst (Cartoon and Illustration), the pen
- * sketches the lines for the first 45% of the time and then the colors wash
- * in. Otherwise the paint washes come first (~55%) and the outlines are drawn
- * stroke by stroke on top.
+ * Coloring-in strokes for the live drawing: back-and-forth hatching that
+ * covers the whole picture patch by patch, the way a person colors in a
+ * sketch. `regions` gives each pixel an area number (0, 1, 2, … = the order
+ * they're colored in, e.g. skin, hair, clothes, then the background), and
+ * `spacings[r]` is the gap between neighboring strokes in area r.
+ *   - Each area is split into square patches, visited row by row in a
+ *     snake order (left→right, then right→left), like a hand moving across.
+ *   - In a patch, parallel hatch lines run at about 60° (the same direction
+ *     as the picture's pencil hatching), a little different per patch.
+ *     Where a line crosses the area, it becomes part of the stroke; the
+ *     stroke zig-zags back and forth from line to line, and lifts off when
+ *     the next piece is far away.
+ * Strokes are drawn with a width of about twice the spacing, so neighbors
+ * overlap and together they cover every pixel. Returns pen strokes
+ * ({ points, segs, length, width, region }) in coloring order.
+ */
+function coloringStrokes(regions, spacings, w, h, scale) {
+  const strokes = [];
+  const patch = Math.round(150 * scale);
+  let region = 0;
+  const flush = (path, width) => {
+    if (path.length >= 2) strokes.push({ points: path, width, region });
+  };
+  for (let r = 0; r < spacings.length; r++) {
+    region = r;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0; y < h; y += 2) {
+      for (let x = 0; x < w; x += 2) {
+        if (regions[y * w + x] !== r) continue;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+    if (x1 < 0) continue;
+    const gap = spacings[r], width = gap * 2.1;
+    const rows = Math.ceil((y1 - y0 + 1) / patch), cols = Math.ceil((x1 - x0 + 1) / patch);
+    for (let py = 0; py < rows; py++) {
+      for (let k = 0; k < cols; k++) {
+        const px = py % 2 ? cols - 1 - k : k; // snake order
+        const bx0 = x0 + px * patch, by0 = y0 + py * patch;
+        const bx1 = Math.min(w, bx0 + patch), by1 = Math.min(h, by0 + patch);
+        const angle = -Math.PI / 3 + (hash2(px + 31 * r, py) - 0.5) * 0.35;
+        const dx = Math.cos(angle), dy = Math.sin(angle), nx = -dy, ny = dx;
+        const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2, half = Math.hypot(bx1 - bx0, by1 - by0) / 2;
+        const at = (v, u) => ({ x: cx + nx * v + dx * u, y: cy + ny * v + dy * u });
+        let path = [], last = null, forward = true;
+        for (let v = -half + gap / 2; v <= half; v += gap) {
+          // The pieces of this hatch line that lie inside the patch AND the area.
+          const runs = [];
+          let start = null;
+          for (let u = -half; u <= half + 2; u += 2) {
+            const p = at(v, u), xi = Math.round(p.x), yi = Math.round(p.y);
+            const inside = u <= half && xi >= bx0 && xi < bx1 && yi >= by0 && yi < by1 && regions[yi * w + xi] === r;
+            if (inside && start === null) start = u;
+            if (!inside && start !== null) { runs.push([start, u - 2]); start = null; }
+          }
+          if (!forward) { runs.reverse(); for (const run of runs) run.reverse(); }
+          for (const [ua, ub] of runs) {
+            const a = at(v, ua), b = at(v, ub);
+            if (last && dist(last, a) > gap * 3) { flush(path, width); path = []; }
+            // Each point twice: the smooth-curve builder then passes exactly
+            // through it (a hand scribbling back and forth has sharp turns).
+            // A slightly offset middle point makes the stroke a little curved.
+            const mid = at(v + (hash2(Math.round(v), Math.round(ua)) - 0.5) * gap * 0.5, (ua + ub) / 2);
+            path.push(a, a, mid, b, b);
+            last = b;
+          }
+          forward = !forward;
+        }
+        flush(path, width);
+      }
+    }
+  }
+  for (const s of strokes) {
+    s.segs = buildSegments(s.points);
+    s.length = s.segs.reduce((sum, seg) => sum + seg.len, 0);
+  }
+  return strokes;
+}
+
+/**
+ * Live version, drawn the way an artist works: first the pen sketches the
+ * lines on blank paper (40% of the time), then the picture is colored in
+ * with back-and-forth strokes (art.colorStrokes), area by area, each stroke
+ * revealing the finished colors underneath.
  */
 function createPaintedDrawer(ctx, art) {
-  const work = makeCanvas(art.width, art.height);
-  const wctx = work.getContext('2d');
-  const frame = wctx.createImageData(art.width, art.height);
   const layer = makeCanvas(ctx.canvas.width, ctx.canvas.height);
   const lctx = layer.getContext('2d');
   setStrokeTransform(lctx, art.scale);
   const pen = createStrokePen(art.strokes, styleOutline);
+  const paper = makeCanvas(art.width, art.height);
+  paper.getContext('2d').putImageData(new ImageData(art.paper, art.width, art.height), 0, 0);
+  const lineShare = art.strokes.length ? 0.4 : 0;
 
-  if (art.linesFirst) {
-    // Ink first, then color (how an illustrator works): the pen sketches the
-    // line art on blank paper, then the colors wash in underneath while the
-    // sketch lines fade into the finished, inked painting.
-    const paper = makeCanvas(art.width, art.height);
-    paper.getContext('2d').putImageData(new ImageData(art.paper, art.width, art.height), 0, 0);
-    const lineShare = art.strokes.length ? 0.45 : 0;
-    let penDone = lineShare === 0;
-    return (progress) => {
-      if (!penDone && progress < lineShare) {
-        pen.advanceTo(lctx, (progress / lineShare) * pen.totalLength);
-        compositePainted(ctx, paper, layer, 1);
-        return;
+  // The coloring layer: each coloring stroke is painted with a "pattern"
+  // made of the finished picture, so wherever a stroke passes, the finished
+  // colors (and their pencil texture) appear, stroke by stroke. Each area
+  // gets its own pattern that is see-through outside the area (grown by 1
+  // pixel so no seams are left), so strokes color inside the lines, like a
+  // careful artist. The layer's transform scales processing pixels to the
+  // output, exactly like drawing the finished picture, so they line up.
+  const colorLayer = makeCanvas(ctx.canvas.width, ctx.canvas.height);
+  const cctx = colorLayer.getContext('2d');
+  cctx.setTransform(art.scale, 0, 0, art.scale, 0, 0);
+  cctx.lineCap = 'round';
+  cctx.lineJoin = 'round';
+  cctx.imageSmoothingQuality = 'high';
+  const { width: w, height: h } = art;
+  const patterns = [];
+  for (let r = 0; r < art.colorRegionCount; r++) {
+    const px = new Uint8ClampedArray(art.painted);
+    const reg = art.colorRegions;
+    for (let y = 0, i = 0; y < h; y++) {
+      for (let x = 0; x < w; x++, i++) {
+        const inside = reg[i] === r || (x > 0 && reg[i - 1] === r) || (x < w - 1 && reg[i + 1] === r) ||
+          (y > 0 && reg[i - w] === r) || (y < h - 1 && reg[i + w] === r);
+        if (!inside) px[i * 4 + 3] = 0;
       }
-      if (!penDone) { pen.advanceTo(lctx, Infinity); penDone = true; }
-      const q = lineShare ? Math.min(1, (progress - lineShare) / (1 - lineShare)) : progress;
-      renderPaintWash(frame, art.painted, art.paper, art.revealAt, q);
-      wctx.putImageData(frame, 0, 0);
-      compositePainted(ctx, q >= 1 ? art.paintCanvas : work, layer, Math.max(0, 1 - q * 1.3));
-    };
+    }
+    const c = makeCanvas(w, h);
+    c.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0);
+    patterns.push(cctx.createPattern(c, 'no-repeat'));
   }
+  const colorPen = createStrokePen(art.colorStrokes, (c, s) => { c.strokeStyle = patterns[s.region]; c.lineWidth = s.width; });
 
-  const paintShare = art.strokes.length ? 0.55 : 1;
-  let paintDone = false;
-
+  let sketch = null; // paper + the finished sketch, made once the pen is done
   return (progress) => {
-    if (!paintDone) {
-      const q = Math.min(1, progress / paintShare);
-      renderPaintWash(frame, art.painted, art.paper, art.revealAt, q);
-      wctx.putImageData(frame, 0, 0);
-      if (q >= 1) paintDone = true;
+    if (progress < lineShare) {
+      pen.advanceTo(lctx, (progress / lineShare) * pen.totalLength);
+      compositePainted(ctx, paper, layer, 1);
+      return;
     }
-    if (progress > paintShare) {
-      pen.advanceTo(lctx, ((progress - paintShare) / (1 - paintShare)) * pen.totalLength);
+    if (!sketch) {
+      pen.advanceTo(lctx, Infinity);
+      sketch = makeCanvas(ctx.canvas.width, ctx.canvas.height);
+      compositePainted(sketch.getContext('2d'), paper, layer, 1);
     }
-    compositePainted(ctx, paintDone ? art.paintCanvas : work, layer, art.outlineOpacity);
+    const q = lineShare < 1 ? Math.min(1, (progress - lineShare) / (1 - lineShare)) : 1;
+    if (q >= 1) { drawPaintedFinal(ctx, art); return; }
+    colorPen.advanceTo(cctx, q * colorPen.totalLength);
+    resetCtx(ctx);
+    ctx.drawImage(sketch, 0, 0);
+    ctx.drawImage(colorLayer, 0, 0);
   };
 }
 
 /**
- * Shared finishing steps for a painted result: paper, reveal plan, pen
- * strokes and the result object that the UI draws.
+ * Shared finishing steps for a painted result: the blank paper, the pen
+ * strokes, and the result object that the UI draws. `colorStrokes`,
+ * `colorRegions` and `colorRegionCount` plan the coloring-in (see
+ * coloringStrokes).
  */
-function makePaintedArt({ w, h, painted, grain, labels, centers, edgeSource, detail, strictness, minPoints, outlineOpacity, faces = 0, customStrokes = null }) {
-  const palette = [];
-  for (let c = 0; c < centers.length / 3; c++) palette.push([centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]]);
+function makePaintedArt({ w, h, painted, grain, edgeSource, detail, strictness, minPoints, faces = 0, customStrokes = null, colorStrokes, colorRegions, colorRegionCount }) {
   const paper = composePaper(grain, w, h);
-  const revealAt = computeRevealOrder(labels, palette, w, h);
   const scale = outputScale(w, h);
 
   // Either strokes built by the caller (Cartoon / Illustration), or soft outlines
@@ -1506,80 +1338,18 @@ function makePaintedArt({ w, h, painted, grain, labels, centers, edgeSource, det
     height: h,
     scale,
     strokes,
+    colorStrokes,
+    colorRegions,
+    colorRegionCount,
     painted,
     paper,
-    revealAt,
     paintCanvas,
-    outlineOpacity,
     faceCount: faces,
     isEmpty: false, // there's always a painting, even with no outlines
     note: '',
     drawFinal(ctx) { drawPaintedFinal(ctx, this); },
     createLiveDrawer(ctx) { return createPaintedDrawer(ctx, this); },
   };
-}
-
-
-/* =============================================================================
-   4. WEB WORKER HELPER
-   -----------------------------------------------------------------------------
-   A Web Worker is a background thread. While it crunches Kuwahara + k-means,
-   the page stays responsive (the spinner keeps spinning).
-   To keep this a no-build static site, we don't ship a separate worker file:
-   we turn the self-contained functions above into source text with
-   .toString(), put it in a Blob, and start the worker from that Blob's URL.
-   If workers aren't available, we just run the same functions on the main thread.
-   ============================================================================= */
-
-const PAINT_WORKER_FUNCTIONS = [kuwaharaFilter, kmeansPlusPlusInit, kmeansQuantize, paintStage];
-
-function createPaintWorker() {
-  const source =
-    PAINT_WORKER_FUNCTIONS.map((fn) => fn.toString()).join('\n\n') +
-    `
-self.onmessage = function (e) {
-  var d = e.data;
-  try {
-    var r = paintStage(d.rgba, d.w, d.h, d.opts);
-    self.postMessage({ ok: true, result: r }, [r.smoothed.buffer, r.labels.buffer]);
-  } catch (err) {
-    self.postMessage({ ok: false, error: String(err) });
-  }
-};`;
-  const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-  const worker = new Worker(url);
-  worker.blobUrl = url;
-  return worker;
-}
-
-function runPaintStage(rgba, w, h, opts) {
-  const onMainThread = async () => {
-    await nextFrame();
-    return paintStage(rgba, w, h, opts);
-  };
-
-  let worker;
-  try {
-    worker = createPaintWorker();
-  } catch (err) {
-    return onMainThread();
-  }
-
-  return new Promise((resolve, reject) => {
-    const cleanup = () => { worker.terminate(); URL.revokeObjectURL(worker.blobUrl); };
-    worker.onmessage = (e) => {
-      cleanup();
-      if (e.data.ok) resolve(e.data.result);
-      else onMainThread().then(resolve, reject);
-    };
-    worker.onerror = (e) => {
-      e.preventDefault();
-      cleanup();
-      onMainThread().then(resolve, reject);
-    };
-    const copy = new Uint8ClampedArray(rgba); // send a copy; we may still need the original for the fallback
-    worker.postMessage({ rgba: copy, w, h, opts }, [copy.buffer]);
-  });
 }
 
 
@@ -1863,8 +1633,9 @@ function resizeMask(mask, mw, mh, w, h) {
    them the way an artist would, so they keep your likeness and work on any
    picture. They run the same steps (buildStylized); STYLE_PRESETS decides
    the look:
-     - Cartoon: a pencil sketch of the photo as it is, colored in with clean,
-       flat cartoon colors (strong flattening, a few clear shading tones).
+     - Cartoon: a colored-pencil drawing: a pencil sketch of the photo as it
+       is, clean colors with a colored-pencil grain, and graphite hatching
+       for the shading (see the compose step in buildStylized).
        Like an artist, it tells busy TEXTURE (carpet, lace: flattened, with
        just a pencil hint of the pattern) from real STRUCTURE (wall streaks,
        wood grain: smoothed along its grain and kept). See textureMap.
@@ -2441,9 +2212,34 @@ function refineFace(ctx, pts, opts = {}) {
     ctx.fill();
   }
 
+  // Pencil style: brow hairs. Short strokes from the brow's lower edge up to
+  // its top, leaning toward the tail the way brow hair grows, flatter and
+  // longer near the tail. The brow outline lists the top edge from the tail
+  // inward, then the bottom edge back out, so both edges run tail → inner end.
+  if (opts.pencil) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = 'rgba(38, 28, 26, 0.5)';
+    ctx.lineWidth = unit * 0.026;
+    for (const brow of [LM.rightBrow, LM.leftBrow]) {
+      const top = pick(pts, brow.slice(0, 5)), bottom = pick(pts, brow.slice(5)).reverse();
+      const at = (edge, t) => { const f = t * 4, k = Math.min(3, Math.floor(f)); return lerpPt(edge[k], edge[k + 1], f - k); };
+      for (let s = 0; s < 24; s++) {
+        const t = (s + 0.5) / 24;                      // 0 = tail, 1 = inner end
+        const lo = at(bottom, t), hi = at(top, t), toTail = at(top, Math.max(0, t - 0.12));
+        const tx = toTail.x - hi.x, ty = toTail.y - hi.y, tl = Math.hypot(tx, ty) || 1;
+        const lean = dist(lo, hi) * (0.9 - 0.5 * t);   // how far a hair leans toward the tail
+        const start = lerpPt(lo, hi, 0.15 + 0.1 * hash2(s, 3)), end = lerpPt(lo, hi, 0.9);
+        ctx.beginPath();
+        ctx.moveTo(start.x, start.y);
+        ctx.quadraticCurveTo(end.x, end.y, end.x + (tx / tl) * lean, end.y + (ty / tl) * lean);
+        ctx.stroke();
+      }
+    }
+  }
+
   const eyes = [
-    { ring: LM.rightEye, iris: LM.rightIris, edge: LM.rightIrisEdge },
-    { ring: LM.leftEye, iris: LM.leftIris, edge: LM.leftIrisEdge },
+    { ring: LM.rightEye, iris: LM.rightIris, edge: LM.rightIrisEdge, brow: LM.rightBrow },
+    { ring: LM.leftEye, iris: LM.leftIris, edge: LM.leftIrisEdge, brow: LM.leftBrow },
   ];
   eyes.forEach((e, k) => { e.color = opts.irisColors ? opts.irisColors[k] : null; });
   for (const e of eyes) {
@@ -2480,6 +2276,18 @@ function refineFace(ctx, pts, opts = {}) {
       ctx.strokeStyle = 'rgba(30, 18, 14, 0.55)';
       ctx.lineWidth = Math.max(0.8, ir * 0.14);
       ctx.beginPath(); ctx.arc(ic.x, ic.y, ir * 0.97, 0, Math.PI * 2); ctx.stroke();
+      if (opts.pencil) {
+        // Pencil style: fine lines radiating from the pupil, the iris's texture.
+        ctx.strokeStyle = 'rgba(30, 18, 14, 0.3)';
+        ctx.lineWidth = Math.max(0.5, ir * 0.06);
+        ctx.beginPath();
+        for (let r = 0; r < 14; r++) {
+          const a = (r / 14) * Math.PI * 2 + hash2(r, 5) * 0.3;
+          ctx.moveTo(ic.x + Math.cos(a) * ir * 0.5, ic.y + Math.sin(a) * ir * 0.5);
+          ctx.lineTo(ic.x + Math.cos(a) * ir * 0.88, ic.y + Math.sin(a) * ir * 0.88);
+        }
+        ctx.stroke();
+      }
       ctx.globalCompositeOperation = 'source-over';
       ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
       ctx.beginPath(); ctx.arc(ic.x - ir * 0.32, ic.y - ir * 0.35, Math.max(0.8, ir * 0.24), 0, Math.PI * 2); ctx.fill();
@@ -2513,6 +2321,34 @@ function refineFace(ctx, pts, opts = {}) {
     ctx.beginPath();
     smoothOpenPath(ctx, lower);
     ctx.stroke();
+
+    if (opts.pencil) {
+      // Pencil style: the eyelid crease (a soft curve above the lid, a third
+      // of the way up to the brow, strongest in the middle) and a few short
+      // lower lashes pointing away from the eye.
+      const eyeMid = centroid(ring), browMid = centroid(pick(pts, e.brow));
+      const ux = browMid.x - eyeMid.x, uy = browMid.y - eyeMid.y;
+      const crease = upper.slice(1, 8).map((p, k) => {
+        const lift = 0.2 + 0.14 * Math.sin((k / 6) * Math.PI);
+        return { x: p.x + ux * lift, y: p.y + uy * lift };
+      });
+      ctx.strokeStyle = 'rgba(70, 45, 38, 0.32)';
+      ctx.lineWidth = unit * 0.03;
+      ctx.beginPath();
+      smoothOpenPath(ctx, crease);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(30, 20, 18, 0.35)';
+      ctx.lineWidth = unit * 0.022;
+      ctx.beginPath();
+      for (let k = 1; k < lower.length - 1; k += 1) {
+        const p = lower[k];
+        const ox = p.x - eyeMid.x, oy = p.y - eyeMid.y, ol = Math.hypot(ox, oy) || 1;
+        const l = unit * (0.05 + 0.03 * hash2(k, 9));
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + (ox / ol) * l, p.y + (oy / ol) * l);
+      }
+      ctx.stroke();
+    }
   }
 
   // Lips: a little richer color, a defined parting line, and a gloss highlight.
@@ -2545,7 +2381,7 @@ function refineFace(ctx, pts, opts = {}) {
   // light curves for the nostril wings, from the side of the nose curling in
   // under it. (The nose is soft in most photos, so the traced lines often
   // miss it.)
-  if (opts.noseSketch) {
+  if (opts.pencil) {
     ctx.globalCompositeOperation = 'source-over';
     ctx.strokeStyle = 'rgba(58, 50, 52, 0.55)';
     ctx.lineWidth = unit * 0.045;
@@ -2593,17 +2429,90 @@ function pencilStreaks(flow, w, h, length) {
 }
 
 /**
+ * Spread values evenly over 0–1 ("histogram equalization"): each value is
+ * replaced by the fraction of all values below it. For a stroke texture this
+ * makes tone exact: inking every pixel whose value is above 1 − m covers
+ * precisely a fraction m of the paper.
+ */
+function equalize(values) {
+  let lo = Infinity, hi = -Infinity;
+  for (const v of values) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const bins = 2048, hist = new Float64Array(bins + 1), range = hi - lo || 1;
+  for (const v of values) hist[Math.min(bins, Math.floor(((v - lo) / range) * bins))]++;
+  const cdf = new Float64Array(bins + 2);
+  for (let b = 0; b <= bins; b++) cdf[b + 1] = cdf[b] + hist[b] / values.length;
+  const out = new Float32Array(values.length);
+  for (let i = 0; i < values.length; i++) {
+    const f = ((values[i] - lo) / range) * bins, b = Math.min(bins, Math.floor(f));
+    out[i] = cdf[b] + (cdf[b + 1] - cdf[b]) * (f - b); // interpolate inside the bin
+  }
+  return out;
+}
+
+/** A repeatable random number in [0, 1) for a pair of integers (an integer hash). */
+function hash2(a, b) {
+  let h = Math.imul(a, 374761393) + Math.imul(b, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/**
+ * Hand-drawn hatching: evenly spaced parallel pencil lines at `angle`
+ * (radians), `spacing` pixels apart, as a 0–1 value per pixel (evenly
+ * spread, see equalize). Each line is broken into strokes of random
+ * pressure that fade in and out at their ends, the lines wobble a little,
+ * and the paper's tooth adds grain, so it looks drawn by hand. Low coverage
+ * gives thin, light lines; more coverage thickens them until they merge.
+ */
+function hatchLines(w, h, angle, spacing) {
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  const wobble = makeValueNoise(w, h, 45);
+  const strokeLen = spacing * 12;
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const across = (-x * sin + y * cos) / spacing + (wobble[i] - 0.5) * 1.1;
+      const line = Math.floor(across);
+      const fromCenter = Math.abs(across - line - 0.5) * 2; // 0 on the line, 1 halfway to the next
+      const along = (x * cos + y * sin) / strokeLen + hash2(line, 11);
+      const stroke = Math.floor(along), t = along - stroke;   // which stroke, and where in it (0–1)
+      const pressure = 0.8 + 0.2 * hash2(line, stroke);
+      const taper = Math.min(1, t / 0.1, (1 - t) / 0.1);
+      out[i] = (1 - fromCenter) * pressure * (0.7 + 0.3 * taper) + (Math.random() - 0.5) * 0.1;
+    }
+  }
+  return equalize(out);
+}
+
+/**
+ * How much of the paper a pencil covers to draw a tone: `m` (0–1) is the
+ * wanted coverage; hatch values above 1 − m are inked, with soft edges.
+ * Darker than 70% coverage, a second, crossing set of strokes is added
+ * ("cross-hatching"), the way artists build up dark areas.
+ */
+function hatchCoverage(h1, h2, m) {
+  const soft = 0.12;
+  const cov = (hv, mm) => smoothstep(1 - mm - soft, 1 - mm + soft, hv);
+  if (m <= 0.7) return cov(h1, m);
+  const second = 1 - (1 - m) / 0.3;
+  return 1 - (1 - cov(h1, 0.7)) * (1 - cov(h2, second));
+}
+
+/**
  * Style presets for the shared engine below (buildStylized). Both styles
  * run the same steps; these numbers decide the look.
  *   Illustration: gentle smoothing, soft many-level shading, colored ink.
- *   Cartoon: stronger flattening, 2–3 clear shading tones per area ("cel
- *   shading"), pencil-sketch lines with a graphite texture, on paper.
+ *   Cartoon: stronger flattening, a few clear shading tones per area,
+ *   pencil-sketch lines, colored-pencil grain and graphite hatching, on paper.
  * Skin settings: skinRich / skinWarm = how much richer (×) and warmer (+)
  * the evened skin tone gets; skinCurve = how much of the contrast curve skin
  * gets (1 = all). The Cartoon keeps skin close to the person's real tone.
  * flattenTexture / keepStructure (Cartoon only): how strongly busy texture
  * is flattened, and how much directional background structure (streaks,
  * wood grain) is protected from smearing. See textureMap.
+ * detailBack (Cartoon only): how much of the detail the smoothing removed is
+ * drawn back in, per area. hatch: how dark the graphite shading strokes get.
  */
 const STYLE_PRESETS = {
   illustration: {
@@ -2624,6 +2533,8 @@ const STYLE_PRESETS = {
     levels: 6, sharpness: 3.4, mixPerson: 0.85, mixBg: 0.9, mixEven: 0.88,
     sCurve: 0.25, gamma: 1.0, lighten: 0.14,
     flattenTexture: 4, keepStructure: 0.8,
+    detailBack: { bg: 0.45, skin: 0.55, hair: 0.6, clothes: 0.8 },
+    hatch: 0.55,
     lines: 'pencil',
   },
 };
@@ -2699,9 +2610,8 @@ async function buildStylized(image, detail, onStatus, preset) {
   // The pencil sketch is traced from a LIGHTLY smoothed copy of the photo (so
   // fine detail survives). Its edge flow also shows where the photo has real
   // structure and where it's only busy texture (textureMap).
-  let lineL = null, flow = null, tex = null, along = null, lineSourceL = null;
+  let lineL = null, flow = null, tex = null, along = null;
   if (preset.lines === 'pencil') {
-    lineSourceL = new Float32Array(guide[0]); // the photo's own lightness, untouched
     lineL = new Float32Array(guide[0]);
     domainTransformSmooth([lineL], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
     flow = edgeTangentFlow(lineL, w, h, 3 * scale);
@@ -2744,6 +2654,9 @@ async function buildStylized(image, detail, onStatus, preset) {
     if (features) sigmaR[i] += (4 - sigmaR[i]) * features[i]; // eyes and teeth stay crisp
   }
   domainTransformSmooth([lab.L, lab.A, lab.B], guide, w, h, preset.sigmaS * scale, sigmaR, 3);
+  // What the smoothing just took away (face shading, dress folds and lace,
+  // …): the pencil style draws it back in with its strokes (see below).
+  const smoothedL = lineL ? new Float32Array(lab.L) : null;
 
   // Clean, richer color: blur the color axes a little (removes blotchy color
   // noise, like a painter's even color fills). More blur = flatter fills.
@@ -2817,10 +2730,10 @@ async function buildStylized(image, detail, onStatus, preset) {
     // Pencil sketch of the photo as it is, traced from lineL (above) with the
     // flow-based ink method from Line art: a main layer of flowing lines plus
     // a finer detail layer.
-    const main = xdogLines(lineL, w, h, 1.0 * scale, { tau: 1, eps: -1.3 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
-    const fine = xdogLines(lineL, w, h, 0.6 * scale, { tau: 1, eps: -1.0 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
+    const main = xdogLines(lineL, w, h, 1.0 * scale, { tau: 1, eps: -1.15 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
+    const fine = xdogLines(lineL, w, h, 0.6 * scale, { tau: 1, eps: -0.9 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
     const combined = new Float32Array(n);
-    for (let i = 0; i < n; i++) combined[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.6);
+    for (let i = 0; i < n; i++) combined[i] = Math.min(main[i], 1 - (1 - fine[i]) * 0.7);
     removeInkSpecks(combined, w, h, Math.round(8 * scale * scale));
     // Pencil lines are a touch thicker than ink: each pixel takes the darkest
     // of itself and its 4 neighbors ("dilation"), so the sketch reads clearly
@@ -2849,7 +2762,7 @@ async function buildStylized(image, detail, onStatus, preset) {
       const hairOrSkin = person ? clamp((hair[i] + skin[i]) * 1.5, 0, 1) : 0;
       let keep = 1 - 0.45 * tex.texture[i] * (1 - hairOrSkin);
       keep *= 0.3 + 0.7 * Math.max(smoothstep(1.5, 3.5, tex.energy[i]), 0.7 * smoothstep(0.65, 0.85, tex.coherence[i]));
-      if (faceInner) keep *= 1 - 0.5 * faceInner[i];
+      if (faceInner) keep *= 1 - 0.4 * faceInner[i];
       if (skinInner) keep *= 1 - 0.3 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1);
       ink[i] = 1 - (1 - ink[i]) * keep;
     }
@@ -2903,6 +2816,24 @@ async function buildStylized(image, detail, onStatus, preset) {
     L[i] = 100 * (s + lighten * (1 - s) * t * t * (3 - 2 * t));
   }
 
+  // Pencil style: add back the detail the smoothing took away (the shape of
+  // the face, folds and lace in the dress, grain in the wall). It gets drawn
+  // with pencil strokes below, so it reads as an artist's shading, not as
+  // photo noise. Clothes get the most, skin a little less (smooth faces).
+  if (smoothedL) {
+    const k = preset.detailBack;
+    for (let i = 0; i < n; i++) {
+      let amount = k.bg;
+      if (person) {
+        const p = clamp(person[i], 0, 1), s = clamp(skin[i], 0, 1), hr = clamp(hair[i], 0, 1);
+        const personAmount = k.skin * s + k.hair * hr + k.clothes * Math.max(0, 1 - s - hr);
+        amount += (personAmount - amount) * p;
+      }
+      if (features) amount *= 1 - features[i];
+      L[i] = clamp(L[i] + (lineL[i] - smoothedL[i]) * amount, 0, 100);
+    }
+  }
+
   onStatus('Coloring…');
   await nextFrame();
   const painted = labToRgba(L, A, B, new Uint8ClampedArray(n * 4));
@@ -2917,34 +2848,50 @@ async function buildStylized(image, detail, onStatus, preset) {
   }
 
   if (preset.lines === 'pencil') {
-    // Compose the pencil sketch over the colors, on paper:
-    //  - line darkness is broken up by the pencil streak texture, so lines
-    //    look like graphite, not ink;
-    //  - darker areas get a light layer of pencil shading that follows the
-    //    form (the same streaks), like an artist shading with the side of
-    //    the pencil;
-    //  - busy texture that was flattened (carpet, lace) gets a light pencil
-    //    hint of its pattern: the darker bits of the photo's fine detail,
-    //    drawn in graphite;
-    //  - the whole picture sits on a subtle paper grain.
+    // A colored-in pencil drawing, on paper:
+    //  - The colors get a fine colored-pencil grain: short strokes that are
+    //    a little lighter or stronger than the color (on average exactly
+    //    the color), more visible in light areas, subtle in dark ones.
+    //  - Shading is drawn in graphite with hatching, like an artist
+    //    sketching: where a spot is darker than its surroundings (a fold,
+    //    the side of the nose, under the chin), diagonal pencil strokes are
+    //    laid down, denser for deeper shadow, and cross-hatched in the
+    //    deepest ones. Light areas stay clean.
+    //  - The graphite sketch lines go on top (their darkness broken up by the
+    //    pencil streak texture, so they look like graphite, not ink), and it
+    //    all sits on a subtle paper grain.
     const streak = pencilStreaks(flow, w, h, 9 * scale);
+    const hatchA = hatchLines(w, h, -Math.PI / 3, 3.4 * scale); // "/" strokes, like a right-handed artist
+    const hatchB = hatchLines(w, h, Math.PI / 5, 3.4 * scale);  // the crossing strokes
+    const toothA = hatchLines(w, h, -Math.PI / 3, 2.4 * scale); // fine, even strokes for the color grain
+    const localL = gaussianBlurSigma(L, w, h, 10 * scale);
     const grain = makePaperGrain(w, h);
-    const fineDetail = gaussianBlurSigma(lineSourceL, w, h, 2.5 * scale);
-    for (let i = 0; i < n; i++) fineDetail[i] = lineSourceL[i] - fineDetail[i]; // negative = darker than around it
+    const P = SETTINGS.paperColor;
+    const paperLum = 0.299 * P[0] + 0.587 * P[1] + 0.114 * P[2];
     const graphite = [44, 41, 46];
+    const hatchStrength = preset.hatch;
     for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const t0 = painted[j], t1 = painted[j + 1], t2 = painted[j + 2];
+      const darkness = clamp(1 - (0.299 * t0 + 0.587 * t1 + 0.114 * t2) / paperLum, 0, 1);
+      const sk = skin ? clamp(skin[i] * 1.3, 0, 1) : 0;
+      // Color grain: k scales how far the color is from the paper (1 = exact
+      // color). Stronger in light colors, where paper tooth shows, and
+      // subtle in dark ones.
+      const k = 1 + (toothA[i] - 0.5) * (0.26 - 0.18 * darkness) * (1 - 0.7 * sk);
+      // Graphite shading: how much darker than its surroundings this spot is
+      // (folds, creases, the shadow side of things). Skin gets very little:
+      // a face shaded with pencil lines looks scratched, so skin keeps its
+      // smooth color shading.
+      const shadow = clamp((localL[i] - L[i]) / 12, 0, 1);
+      const hatch = hatchCoverage(hatchA[i], hatchB[i], shadow * 0.8) * hatchStrength * (1 - 0.85 * sk);
       let dark = 1 - ink[i];
       if (outline) dark = Math.max(dark, outline[i] * 1.2);
-      const texture = clamp(0.8 + (streak[i] - 0.5) * 1.1, 0.45, 1);
-      let pd = clamp(dark * texture * 1.05, 0, 0.95);
-      const tone = clamp((45 - L[i]) / 35, 0, 1); // how dark this area is
-      const shade = tone * clamp((streak[i] - 0.45) * 2.5, 0, 1) * 0.22;
-      pd = 1 - (1 - pd) * (1 - shade);
-      const hairOrSkin = person ? clamp((hair[i] + skin[i]) * 1.5, 0, 1) : 0;
-      const hint = tex.texture[i] * (1 - hairOrSkin) * clamp(-fineDetail[i] / 8, 0, 1) * 0.4;
-      pd = 1 - (1 - pd) * (1 - hint);
+      const line = clamp(dark * clamp(0.8 + (streak[i] - 0.5) * 1.1, 0.45, 1) * 1.05, 0, 0.95);
+      const pd = 1 - (1 - line) * (1 - hatch);
       const g = 1 + (grain[i] - 1) * 0.7;
-      for (let c = 0; c < 3; c++) painted[j + c] = (painted[j + c] * (1 - pd) + graphite[c] * pd) * g;
+      painted[j] = ((P[0] - (P[0] - t0) * k) * (1 - pd) + graphite[0] * pd) * g;
+      painted[j + 1] = ((P[1] - (P[1] - t1) * k) * (1 - pd) + graphite[1] * pd) * g;
+      painted[j + 2] = ((P[2] - (P[2] - t2) * k) * (1 - pd) + graphite[2] * pd) * g;
     }
   } else {
     // Ink is colored by what's underneath (dark brown on skin, near-black on
@@ -2976,7 +2923,7 @@ async function buildStylized(image, detail, onStatus, preset) {
     for (const pts of faces) {
       refineFace(fctx, pts, {
         irisColors: [irisColor(photo, w, h, pts, LM.rightIris, LM.rightIrisEdge), irisColor(photo, w, h, pts, LM.leftIris, LM.leftIrisEdge)],
-        noseSketch: preset.lines === 'pencil',
+        pencil: preset.lines === 'pencil', // hand-drawn extras: brow hairs, creases, lashes, iris lines, nose
       });
     }
     painted.set(fctx.getImageData(0, 0, w, h).data);
@@ -2985,8 +2932,11 @@ async function buildStylized(image, detail, onStatus, preset) {
   // Pen strokes for the live drawing: the lines' center lines.
   onStatus('Preparing the sketch…');
   await nextFrame();
+  // (The pencil sketch takes lighter lines too, so the sketching stage shows
+  // the drawing's detail, not just its outlines.)
+  const lineCut = preset.lines === 'pencil' ? 0.62 : 0.45;
   const lineBin = new Uint8Array(n);
-  for (let i = 0; i < n; i++) lineBin[i] = ink[i] < 0.45 || (outline && outline[i] > 0.3) ? 1 : 0;
+  for (let i = 0; i < n; i++) lineBin[i] = ink[i] < lineCut || (outline && outline[i] > 0.3) ? 1 : 0;
   // Grow by 1 pixel to bridge tiny gaps (see Line art), then thin to center lines.
   const bin = new Uint8Array(n);
   for (let y = 1; y < h - 1; y++) {
@@ -2997,14 +2947,17 @@ async function buildStylized(image, detail, onStatus, preset) {
   }
   thinLines(bin, w, h);
   let raw = filterAndSimplify(traceContours(bin, w, h), Math.round((preset.lines === 'pencil' ? 5 : 10) * scale), SETTINGS.rdpEpsilon);
-  raw = suppressTexture(raw, w, h, { maxDensity: preset.lines === 'pencil' ? 0.15 : 0.12 });
+  raw = suppressTexture(raw, w, h, { maxDensity: preset.lines === 'pencil' ? 0.2 : 0.12 });
+  // The sketch also draws the face's features (eyes, irises, brows, nose and
+  // lips from the landmarks, like Line art), so the face takes shape early.
+  if (preset.lines === 'pencil' && faces.length) raw = addLandmarkFeatureLines(raw, faces);
   const strokes = finalizeStrokes(raw);
   const outScale = outputScale(w, h);
   for (const s of strokes) {
     if (preset.lines === 'pencil') {
-      s.outlineWidth = (1.0 + 0.9 * strokeProminence(s)) / outScale;
+      s.outlineWidth = (s.feature ? 1.3 : 1.0 + 0.9 * strokeProminence(s)) / outScale;
       s.outlineColor = '#3a363a';
-      s.outlineAlpha = 0.8;
+      s.outlineAlpha = s.feature ? 0.7 : 0.8;
     } else {
       s.outlineWidth = (1.1 + 0.9 * strokeProminence(s)) / outScale;
       s.outlineColor = '#2a1c16';
@@ -3012,14 +2965,25 @@ async function buildStylized(image, detail, onStatus, preset) {
     }
   }
 
-  const { labels: washLabels, centers } = await runPaintStage(painted, w, h, { radii: [], k: 12, maxIter: 10 });
+  // Coloring-in strokes for the live drawing, area by area in the order a
+  // person would color: skin first, then hair, clothes, and the background
+  // last with broader strokes. (Without the person finder: one area.)
+  const regions = new Uint8Array(n);
+  let spacings = [8 * scale];
+  if (person) {
+    for (let i = 0; i < n; i++) {
+      if (person[i] < 0.5) { regions[i] = 3; continue; }
+      const s = skin[i], hr = hair[i], cl = clothes[i];
+      regions[i] = s >= hr && s >= cl ? 0 : hr >= cl ? 1 : 2;
+    }
+    spacings = [4.5 * scale, 5.5 * scale, 5.5 * scale, 8 * scale];
+  }
   const art = makePaintedArt({
-    w, h, painted, grain: makePaperGrain(w, h), labels: washLabels, centers,
-    customStrokes: strokes, outlineOpacity: 1, faces: faces.length,
+    w, h, painted, grain: makePaperGrain(w, h), customStrokes: strokes, faces: faces.length,
+    colorStrokes: coloringStrokes(regions, spacings, w, h, scale), colorRegions: regions, colorRegionCount: spacings.length,
   });
   art.mode = preset.mode;
-  art.linesFirst = true; // sketch first, then color in
-  art.linesBaked = true;
+  art.durationScale = 1.5; // two stages (sketching, then coloring), so it takes a bit longer
   return art;
 }
 
@@ -3640,7 +3604,10 @@ ui.dropZone.addEventListener('drop', (e) => loadFile(e.dataTransfer.files[0]));
 /* ---------- Options ---------- */
 
 ui.detail.addEventListener('input', () => { ui.detailValue.textContent = ui.detail.value; });
-ui.speed.addEventListener('input', () => { ui.speedValue.textContent = `${Number(ui.speed.value).toFixed(1)}x`; });
+ui.speed.addEventListener('input', () => {
+  const v = Number(ui.speed.value);
+  ui.speedValue.textContent = `${v < 1 ? v.toFixed(2).replace(/0$/, '') : v.toFixed(1)}x`; // 0.25x, 0.5x, 1.0x, 1.5x
+});
 ui.liveToggle.addEventListener('change', () => {
   ui.speedField.hidden = !ui.liveToggle.checked;
   ui.musicField.hidden = !ui.liveToggle.checked;
@@ -3838,8 +3805,10 @@ async function generate() {
     ui.status.textContent = 'Drawing…';
     state.song = musicChoice !== 'none' ? startSelectedSong(musicChoice) : null;
 
-    // ~8 s at 1x; 2x speed → 4 s, 0.5x → 16 s. The pen's pace is derived from the total work inside drawAt.
-    const duration = SETTINGS.baseDurationMs / speed;
+    // Line art takes ~8 s at 1x (Cartoon and Illustration 1.5× that, since
+    // they're sketched and then colored in); 2x speed halves it, 0.25x takes
+    // 4 times as long. The pen's pace is derived from the total work inside drawAt.
+    const duration = (SETTINGS.baseDurationMs * (art.durationScale || 1)) / speed;
     const finished = await animateDrawing(drawAt, duration, (p) => { ui.progressBar.style.width = `${p * 100}%`; }, cancelled);
     if (!finished) return;
 

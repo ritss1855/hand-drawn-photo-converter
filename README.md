@@ -1,6 +1,6 @@
 # Photo → Drawing
 
-Turn any photo into **glowing line art**, a **pencil-sketched cartoon that's colored in**, or a **detailed digital illustration**, and watch it get drawn live. You can save the result as an image or a video, or share it straight from your phone.
+Turn any photo into **glowing line art**, a **colored-pencil drawing**, or a **detailed digital illustration**, and watch it get sketched and colored in live. You can save the result as an image or a video, or share it straight from your phone.
 
 Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no build step. The one runtime dependency is Google's MediaPipe Tasks Vision library, which is loaded from a CDN only when it's needed.
 
@@ -21,28 +21,42 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 6. **Flow-based XDoG ink lines** (eXtended Difference of Gaussians, smoothed along the edge flow): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
 7. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips. The eyes and teeth are kept true to the photo, so eye color and smiles survive.
 
-In live mode, the pen inks the line art first, then the colors wash in underneath. Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
+In live mode, the pen inks the line art first, then it's colored in with strokes (see *Live drawing* below). Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
 **Line art** draws glowing, detailed lines with the *flow-based XDoG* method (after Kang et al., "Coherent Line Drawing", and Winnemöller et al.):
 1. Edge-aware smoothing (domain transform) removes noise but keeps fine edges.
 2. An *edge tangent flow* field measures which way lines run at every pixel.
 3. The Difference-of-Gaussians ink signal is smoothed *along* that flow, so faint, broken detections (hair strands, fabric folds) join into long, flowing lines.
 4. This runs at two sizes: one for the main contours and a finer one that adds small details (strands of hair, lashes, creases, textures), merged into one drawing.
+5. A third pass looks only inside dark areas (black clothes, dark hair). Their detail sits near the bottom of the lightness scale, where differences are too small to notice, so the darks are stretched (a *gamma* curve, like lifting the shadows in a photo editor) and searched with a more sensitive threshold. That's what brings out the folds and texture of a black dress.
 
 The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, brows, nose and lips. Dark photos are brightened for line finding only.
 
-**Cartoon** is a **pencil sketch of your photo, colored in**, the way a cartoonist sketches from a reference photo and then colors the sketch. It runs on the same engine as Illustration with a different recipe (a "preset"):
+**Cartoon** is a **colored-pencil drawing of your photo**: sketched in graphite the way it really is, then colored in with pencil strokes, the way an artist draws from a reference photo. It runs on the same engine as Illustration with a different recipe (a "preset"):
 
-1. **Pencil lines that follow the photo as it is:** flow-based XDoG at two sizes finds the main contours and the fine detail (hair strands, folds, fingers, facial features), and tiny specks are removed. The lines are drawn in graphite gray with a real *pencil texture*: random noise smeared along the edge flow (line integral convolution), so every line looks like it's made of small parallel pencil strokes. Dark areas get light pencil shading, and paper grain shows through.
-2. **Colored in:** stronger edge-aware smoothing flattens each area into a clean fill, and the lightness is gathered into a few clear shading tones (cel shading), so it looks like marker or colored-pencil coloring rather than a painting. The colors come from the photo: the hair, clothes and background with a gentle vibrance boost, and the person's **real skin tone**, kept close to the photo (flash glare evened out, but no lightening or orange tint). Midtones of the background and clothes are lifted a little, like color on white paper, while deep darks such as black hair stay dark.
+1. **Pencil lines that follow the photo as it is:** flow-based XDoG at two sizes finds the main contours and the fine detail (hair strands, folds, fingers, facial features), and tiny specks are removed. The lines are drawn in graphite gray with a real *pencil texture*: random noise smeared along the edge flow (line integral convolution), so every line looks like it's made of small parallel pencil strokes.
+2. **Clean colors:** edge-aware smoothing flattens each area into a clean fill with a few clear shading tones. The colors come from the photo: the hair, clothes and background with a gentle vibrance boost, and the person's **real skin tone**, kept close to the photo (flash glare evened out, but no lightening or orange tint).
 3. **Texture vs. structure,** the way an artist sees it. The *structure tensor* measures, around every pixel, how strong the detail is and whether it all runs one way (*coherence*):
-   - **Busy texture** (carpet, lace, gravel; strong but pointing every which way) is flattened into a clean fill, with just a light pencil hint of its pattern instead of scribbles.
+   - **Busy texture** (carpet, lace, gravel; strong but pointing every which way) is flattened into a clean fill instead of scribbles.
    - **Directional texture** (wall streaks, wood grain) is smoothed *along* its own grain, so it becomes clean streaks of color instead of smudges.
    - **Bold patterns** (a printed pillow) count as design and are kept.
-4. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
-5. **Face** from the 478 face landmarks. The eyes and the inside of the mouth are kept true to the photo, so the **eye color** (sampled from the iris) and a **smile's teeth** survive. Then clean eyes with an iris ring and catchlight, lash lines, brows, lips, and a light pencil nose. Stray lines across the cheeks are softened.
+4. **Detail drawn back in:** the detail the smoothing took away (the shape of the face, folds and lace in the dress, grain in the wall) is added back as shading, so nothing looks airbrushed.
+5. **Drawn in pencil, not painted:**
+   - The colors get a fine *colored-pencil grain*: evenly spaced diagonal strokes a little lighter or stronger than the color (on average exactly the color), more visible in light areas and subtle on skin.
+   - *Graphite hatching* shades whatever is darker than its surroundings (a fold, the side of the nose, under the chin), with diagonal strokes that get denser in deeper shadow and cross-hatched in the deepest. The hatch lines are drawn procedurally (evenly spaced lines, broken into strokes with random pressure that fade in and out), so they look hand-drawn. Skin gets very little hatching, so faces stay smooth.
+   - Everything sits on a subtle paper grain.
+6. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
+7. **Face** from the 478 face landmarks. The eyes and the inside of the mouth are kept true to the photo, so the **eye color** (sampled from the iris) and a **smile's teeth** survive. On top go the details an artist draws: individual **brow hairs**, the **eyelid crease**, upper and lower **lashes**, fine lines in the **iris**, a catchlight, the lips, and the nostril wings of the nose. Stray lines across the cheeks are softened.
 
-In live mode, the pencil sketches the whole drawing on blank paper first, then the colors wash in. The *Edge detail* slider controls how many pencil lines appear and how flat the colors get. It works on any photo. With people in it, the face and body tools make skin, hair and clothes look their best, and with no person it sketches and colors the scene.
+The *Edge detail* slider controls how many pencil lines appear and how flat the colors get. It works on any photo. With people in it, the face and body tools make skin, hair and clothes look their best, and with no person it sketches and colors the scene.
+
+### Live drawing
+
+Turn on **Show it drawn out live** to watch the picture being made (and save it as a video):
+
+- **Line art:** a glowing pen traces every line, then the full-detail ink fades in.
+- **Cartoon and Illustration:** first a pencil sketches the whole drawing on blank paper, including the face's features. Then it's **colored in stroke by stroke**, like someone coloring a sketch: back-and-forth hatching strokes fill the picture patch by patch, skin first, then hair, clothes, and the background last. Each area is colored inside its own lines. Every coloring stroke reveals the finished picture underneath, so the last frame is exactly the final image.
+- **Drawing speed** goes from **0.25x** (4 times slower) to **2x**. At 1x, Line art takes about 8 s, and Cartoon and Illustration about 12 s (they're sketched and then colored). At 0.25x that becomes 32 s and 48 s.
 
 | Library / model | Size | Source | License |
 | --- | --- | --- | --- |
@@ -77,11 +91,10 @@ The sections in `app.js` are:
 
 0. Settings & helpers
 1. **Shared pipeline**: downscale, grayscale, contrast stretch, Gaussian blur, Sobel, non-max suppression, hysteresis threshold, contour tracing, smoothing, RDP simplification, stroke ordering, smooth curves (every style's lines go through the tracing and curve steps to become pen strokes)
-2. **Mode 1: Line art**: two-size flow-based XDoG, glowing ink rendering, the live pen
-3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (k-means color regions + reveal order), the result object
-4. Web Worker helper (runs k-means off the main thread)
+2. **Mode 1: Line art**: two-size flow-based XDoG plus a dark-area pass, glowing ink rendering, the live pen
+3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (coloring strokes planned patch by patch, revealed through per-area patterns), the result object
 4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
-4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, pencil texture (Cartoon) or ink (Illustration), speck removal, Zhang–Suen thinning (for the live pen), face refinement
+4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, detail restoration, colored-pencil grain and graphite hatching (`hatchLines`, `hatchCoverage`) for the Cartoon or ink for the Illustration, speck removal, Zhang–Suen thinning (for the live pen), face refinement
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback

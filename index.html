@@ -22,10 +22,10 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='1' x2='1' y2='0'%3E%3Cstop offset='0' stop-color='%23ff8a5b'/%3E%3Cstop offset='1' stop-color='%23b36bff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%230f0e17'/%3E%3Cpath d='M14 50l4-12 24-24 8 8-24 24z' fill='url(%23g)'/%3E%3Cpath d='M14 50l4-12 8 8z' fill='%23ffe3c2'/%3E%3C/svg%3E">
 
   <!-- Relative paths only, so the site works inside a GitHub Pages sub-folder -->
-  <!-- "?v=28" makes browsers fetch the new files after an update instead of an old cached copy.
+  <!-- "?v=41" makes browsers fetch the new files after an update instead of an old cached copy.
        Bump the number whenever you change style.css or app.js. -->
-  <link rel="stylesheet" href="style.css?v=28">
-  <script src="app.js?v=28" defer></script>
+  <link rel="stylesheet" href="style.css?v=41">
+  <script src="app.js?v=41" defer></script>
 </head>
 <body>
 
@@ -65,7 +65,7 @@
           <span class="mode-card">
             <span class="swatch swatch-cartoon" aria-hidden="true"></span>
             <strong>Cartoon</strong>
-            <small>Pencil-sketched, then colored in</small>
+            <small>Sketched, then colored in with pencil</small>
           </span>
         </label>
         <label class="mode-option">
@@ -98,8 +98,8 @@
           <label for="speed">Drawing speed</label>
           <output id="speed-value" for="speed">1.0x</output>
         </div>
-        <input type="range" id="speed" min="0.5" max="2" step="0.1" value="1">
-        <div class="range-hints"><span>0.5x slower</span><span>2x faster</span></div>
+        <input type="range" id="speed" min="0.25" max="2" step="0.05" value="1">
+        <div class="range-hints"><span>0.25x slower</span><span>2x faster</span></div>
       </div>
 
       <div class="field" id="music-field" hidden>
@@ -125,7 +125,7 @@
     <footer class="footer">
       🔒 Everything runs in your browser. Your photos are never uploaded or stored.<br>
       The AI models download once and run on your device.<br>
-      <small class="version">v14 · Cartoon keeps your real eyes, smile and skin tone; cleaner backgrounds</small>
+      <small class="version">v15 · Colored-pencil Cartoon, colored in live stroke by stroke; more detailed line art</small>
     </footer>
   </main>
 
