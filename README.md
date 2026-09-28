@@ -1,6 +1,6 @@
 # Photo → Drawing
 
-Turn any photo into **glowing line art**, a **colored-pencil drawing**, or a **detailed digital illustration**, and watch it get sketched and colored in live. You can save the result as an image or a video, or share it straight from your phone.
+Turn any photo into **glowing line art**, a **colored-pencil drawing**, or a **2D animation style illustration**, and watch it get sketched and colored in live. You can save the result as an image or a video, or share it straight from your phone.
 
 Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no build step. The one runtime dependency is Google's MediaPipe Tasks Vision library, which is loaded from a CDN only when it's needed.
 
@@ -12,16 +12,14 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 
 **Works on all kinds of photos.** Every style first smooths the photo with an *edge-aware* filter, which flattens fabric patterns, carpet, skin pores and noise but keeps real edges. It then finds lines that follow the shapes' flow, and drops "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Skin is evened out toward its real mid-tone color, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
 
-**Illustration** keeps the photo's real shapes, lighting and detail (so it keeps the person's likeness and works on any picture) and re-renders it as a clean digital illustration, following the classic "image abstraction" recipe from computer-graphics research:
-1. **Lab color**, to treat lightness and color separately.
-2. **Edge-aware smoothing** with the *domain transform* filter. It turns skin, fabric and walls into clean surfaces while every real edge stays sharp. It's region-aware via MediaPipe segmentation: skin is smoothest, hair and clothes keep detail, and the background is more painterly.
-3. **Even skin tone:** camera-flash glare is compressed and pulled back to the skin's real mid-tone color.
-4. **Bold color:** a "vibrance" boost (muted colors are strengthened most, true neutrals are left alone), an S-curve for deeper contrast, and a gentle warm grade. Normally lit photos are no longer brightened, so darks stay rich.
-5. **Soft shading bands**, a gently stepped version of the photo's lighting.
-6. **Flow-based XDoG ink lines** (eXtended Difference of Gaussians, smoothed along the edge flow): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
-7. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips. The eyes and teeth are kept true to the photo, so eye color and smiles survive.
+**Illustration** turns the photo into a **2D animation** frame, like a still from an animated series: the person is repainted in flat colors with crisp cel shading and clean outlines, over a soft painted background. The shapes all come from the photo itself, so the person still looks like themselves:
+1. **Flat base colors:** edge-aware smoothing (the *domain transform*, guided by MediaPipe's body segmentation) flattens each area, skin, hair and each piece of clothing, into one clean color, while the edges between areas stay sharp. Skin gets one even tone: the person's own mid-tone skin color, so flash glare and shadows don't count.
+2. **Cel shading:** the photo's light-and-shadow shapes (lightly smoothed) are compared with each area's flat color. Where they're clearly darker, the area gets a second, darker tone with a crisp edge, a little richer in color and warmer on skin, like painted cel shadows. Hair and skin also get a lighter tone where they catch the light, and hair keeps sharper shapes, so it shows clumps and a shine.
+3. **Clean outlines:** flow-based XDoG finds the edges between the flat areas and the strongest edges of the form (jaw, ear, the side of the nose), plus the person's outline. They're drawn in a deep shade of the color underneath (dark brown on skin, deep navy on a blue jacket), never on the background.
+4. **An animated face** from the 478 face landmarks: clean white eyes with a flat iris in the person's own eye color, a dark pupil and two sparkles, solid brows, a simple nose, flat lips (teeth kept) and a soft blush.
+5. **A soft painted background:** the scene behind the person is smoothed into big, gently blended shapes, with no lines, the way animation paints backgrounds separately from characters.
 
-In live mode, the pen inks the line art first, then it's colored in with strokes (see *Live drawing* below). Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
+Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
 **Line art** draws glowing, detailed lines with the *flow-based XDoG* method (after Kang et al., "Coherent Line Drawing", and Winnemöller et al.):
 1. Edge-aware smoothing (domain transform) removes noise but keeps fine edges.
@@ -46,7 +44,7 @@ The finished picture is rendered straight from that ink, with natural thick-to-t
    - *Graphite hatching* shades whatever is darker than its surroundings (a fold, the side of the nose, under the chin), with diagonal strokes that get denser in deeper shadow and cross-hatched in the deepest. The hatch lines are drawn procedurally (evenly spaced lines, broken into strokes with random pressure that fade in and out), so they look hand-drawn. Skin gets very little hatching, so faces stay smooth.
    - Everything sits on a subtle paper grain.
 6. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
-7. **Face** from the 478 face landmarks. The eyes and the inside of the mouth are kept true to the photo, so the **eye color** (sampled from the iris) and a **smile's teeth** survive. On top go the details an artist draws: individual **brow hairs**, the **eyelid crease**, upper and lower **lashes**, fine lines in the **iris**, a catchlight, the lips, and the nostril wings of the nose. Stray lines across the cheeks are softened.
+7. **Face** from the 478 face landmarks. The eyes and the inside of the mouth are kept true to the photo, so the **eye color** (sampled from the iris) and a **smile's teeth** survive. On top go the details an artist draws: individual **brow hairs**, the **eyelid crease**, natural **lashes** (a clean lid line and a few short lashes, on everyone, so no one gets a heavy mascara look), fine lines in the **iris**, a catchlight, the lips, and the nostril wings of the nose. Stray lines across the cheeks are softened.
 
 The *Edge detail* slider controls how many pencil lines appear and how flat the colors get. It works on any photo. With people in it, the face and body tools make skin, hair and clothes look their best, and with no person it sketches and colors the scene.
 
@@ -94,13 +92,14 @@ The sections in `app.js` are:
 2. **Mode 1: Line art**: two-size flow-based XDoG plus a dark-area pass, glowing ink rendering, the live pen
 3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (coloring strokes planned patch by patch, revealed through per-area patterns), the result object
 4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
-4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, detail restoration, colored-pencil grain and graphite hatching (`hatchLines`, `hatchCoverage`) for the Cartoon or ink for the Illustration, speck removal, Zhang–Suen thinning (for the live pen), face refinement
+4c. **Mode 2: Cartoon** (`buildSketchCartoon`) and the tools it shares with the Illustration: Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, detail restoration, colored-pencil grain and graphite hatching (`hatchLines`, `hatchCoverage`), speck removal, Zhang–Suen thinning (for the live pen), face refinement (`refineFace`), and the shared first and last steps (`preparePhoto`, `finishPaintedArt`)
+4d. **Mode 3: Illustration** (`buildIllustration`): the 2D animation look: flat base colors, crisp two-tone cel shading, clean outlines, the animated face, a soft painted background
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback
 7. UI wiring
 
-Sections 1–4c don't touch the page's DOM, so they can later be moved into their own files (for example `shared-pipeline.js`, `line-art.js`, `stylized.js`, loaded with extra `<script defer>` tags before `app.js`).
+Sections 1–4d don't touch the page's DOM, so they can later be moved into their own files (for example `shared-pipeline.js`, `line-art.js`, `cartoon.js`, `illustration.js`, loaded with extra `<script defer>` tags before `app.js`).
 
 > After changing `app.js` or `style.css`, bump the `?v=` number on their links in `index.html` so visitors' browsers load the new version instead of an old cached copy.
 

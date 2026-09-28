@@ -176,12 +176,15 @@ body {
     #f5eede;
 }
 
+/* Illustration: a flat, outlined 2D animation character (flat skin with a
+   crisp shadow side, dark hair, a navy jacket) on a soft painted backdrop. */
 .swatch-illustration {
   background:
-    radial-gradient(circle at 50% 42%, #c98a64 0 13px, transparent 14px),
-    radial-gradient(ellipse at 50% 30%, #1d1412 0 20px, transparent 21px),
-    radial-gradient(ellipse at 50% 120%, #232027 0 30px, transparent 31px),
-    linear-gradient(160deg, #7a5a44, #3c3446);
+    linear-gradient(90deg, transparent 50%, rgba(170, 88, 66, 0.35) 50%) 50% 46% / 24px 24px no-repeat,
+    radial-gradient(circle at 50% 46%, #f2b89a 0 12px, #2a1c16 12px 13.5px, transparent 14px),
+    radial-gradient(ellipse at 50% 36%, #5a3526 0 19px, #2a1c16 19px 20.5px, transparent 21px),
+    radial-gradient(ellipse at 50% 125%, #34466e 0 30px, #1c2440 30px 31.5px, transparent 32px),
+    linear-gradient(160deg, #a9cfe0, #86a57f);
 }
 
 .field-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
