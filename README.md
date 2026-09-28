@@ -19,7 +19,7 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 4. **Bold color:** a "vibrance" boost (muted colors are strengthened most, true neutrals are left alone), an S-curve for deeper contrast, and a gentle warm grade. Normally lit photos are no longer brightened, so darks stay rich.
 5. **Soft shading bands**, a gently stepped version of the photo's lighting.
 6. **Flow-based XDoG ink lines** (eXtended Difference of Gaussians, smoothed along the edge flow): artist-like lines, bold on strong edges and fading on soft ones, colored by what's underneath. Tiny specks are removed, and lines inside smooth skin are softened.
-7. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips.
+7. **Face refinement** from the 478 face landmarks: side shading for depth, defined lash lines, iris ring and catchlight, cleaner brows and glossy lips. The eyes and teeth are kept true to the photo, so eye color and smiles survive.
 
 In live mode, the pen inks the line art first, then the colors wash in underneath. Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
@@ -34,9 +34,13 @@ The finished picture is rendered straight from that ink, with natural thick-to-t
 **Cartoon** is a **pencil sketch of your photo, colored in**, the way a cartoonist sketches from a reference photo and then colors the sketch. It runs on the same engine as Illustration with a different recipe (a "preset"):
 
 1. **Pencil lines that follow the photo as it is:** flow-based XDoG at two sizes finds the main contours and the fine detail (hair strands, folds, fingers, facial features), and tiny specks are removed. The lines are drawn in graphite gray with a real *pencil texture*: random noise smeared along the edge flow (line integral convolution), so every line looks like it's made of small parallel pencil strokes. Dark areas get light pencil shading, and paper grain shows through.
-2. **Colored in:** stronger edge-aware smoothing flattens each area into a clean fill, and the lightness is gathered into a few clear shading tones (cel shading), so it looks like marker or colored-pencil coloring rather than a painting. The colors come from the photo: the real skin tone (with flash glare evened out), hair, clothes and background, with a vibrance boost. Midtones are lifted a little, like color on white paper, while deep darks such as black hair stay dark.
-3. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
-4. **Face refinement** from the 478 face landmarks: clean eyes with an iris ring and catchlight, lash lines, brows and lips.
+2. **Colored in:** stronger edge-aware smoothing flattens each area into a clean fill, and the lightness is gathered into a few clear shading tones (cel shading), so it looks like marker or colored-pencil coloring rather than a painting. The colors come from the photo: the hair, clothes and background with a gentle vibrance boost, and the person's **real skin tone**, kept close to the photo (flash glare evened out, but no lightening or orange tint). Midtones of the background and clothes are lifted a little, like color on white paper, while deep darks such as black hair stay dark.
+3. **Texture vs. structure,** the way an artist sees it. The *structure tensor* measures, around every pixel, how strong the detail is and whether it all runs one way (*coherence*):
+   - **Busy texture** (carpet, lace, gravel; strong but pointing every which way) is flattened into a clean fill, with just a light pencil hint of its pattern instead of scribbles.
+   - **Directional texture** (wall streaks, wood grain) is smoothed *along* its own grain, so it becomes clean streaks of color instead of smudges.
+   - **Bold patterns** (a printed pillow) count as design and are kept.
+4. **Outline of the person** from MediaPipe's body segmentation, so the figure stands out from the background.
+5. **Face** from the 478 face landmarks. The eyes and the inside of the mouth are kept true to the photo, so the **eye color** (sampled from the iris) and a **smile's teeth** survive. Then clean eyes with an iris ring and catchlight, lash lines, brows, lips, and a light pencil nose. Stray lines across the cheeks are softened.
 
 In live mode, the pencil sketches the whole drawing on blank paper first, then the colors wash in. The *Edge detail* slider controls how many pencil lines appear and how flat the colors get. It works on any photo. With people in it, the face and body tools make skin, hair and clothes look their best, and with no person it sketches and colors the scene.
 
@@ -77,7 +81,7 @@ The sections in `app.js` are:
 3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (k-means color regions + reveal order), the result object
 4. Web Worker helper (runs k-means off the main thread)
 4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
-4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, pencil texture (Cartoon) or ink (Illustration), speck removal, Zhang–Suen thinning (for the live pen), face refinement
+4c. **Modes 2 & 3: Cartoon and Illustration**: one shared engine (`buildStylized`) with two presets. Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, pencil texture (Cartoon) or ink (Illustration), speck removal, Zhang–Suen thinning (for the live pen), face refinement
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback

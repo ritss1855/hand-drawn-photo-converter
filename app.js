@@ -55,6 +55,15 @@ const SETTINGS = {
 /** Keep a number inside [lo, hi]. */
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
+/**
+ * Smooth 0→1 ramp as x goes from a to b (flat at both ends, so masks built
+ * from it have soft edges). Works "backwards" too, when a > b.
+ */
+const smoothstep = (a, b, x) => {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
 /** Create an off-screen canvas of a given size. */
 function makeCanvas(w, h) {
   const c = document.createElement('canvas');
@@ -1856,7 +1865,12 @@ function resizeMask(mask, mw, mh, w, h) {
    the look:
      - Cartoon: a pencil sketch of the photo as it is, colored in with clean,
        flat cartoon colors (strong flattening, a few clear shading tones).
+       Like an artist, it tells busy TEXTURE (carpet, lace: flattened, with
+       just a pencil hint of the pattern) from real STRUCTURE (wall streaks,
+       wood grain: smoothed along its grain and kept). See textureMap.
      - Illustration: a detailed digital painting with soft shading and ink.
+   Both keep the eyes and the inside of the mouth true to the photo, so eye
+   color and a smile's teeth survive (see faceMasks and irisColor).
    The recipe comes from computer-graphics research on "image abstraction"
    (Winnemöller et al., "Real-Time Video Abstraction"):
 
@@ -1928,8 +1942,14 @@ function labToRgba(L, A, B, out) {
   return out;
 }
 
-/** Gaussian blur with any sigma (separable; kernel radius 3·sigma). */
+/**
+ * Gaussian blur with any sigma (separable; kernel radius 3·sigma).
+ * Wide blurs use a shortcut: three box blurs in a row look the same as a
+ * Gaussian (the "central limit theorem" at work), and a box blur costs the
+ * same for any width, using a running sum.
+ */
 function gaussianBlurSigma(src, w, h, sigma) {
+  if (sigma > 3) return boxBlurGauss(src, w, h, sigma);
   const r = Math.max(1, Math.ceil(sigma * 3));
   const k = new Float32Array(2 * r + 1);
   let sum = 0;
@@ -1952,6 +1972,37 @@ function gaussianBlurSigma(src, w, h, sigma) {
     }
   }
   return out;
+}
+
+/**
+ * Three box blurs whose combined spread matches a Gaussian of `sigma`
+ * (box widths from the classic "boxes for Gauss" formula).
+ */
+function boxBlurGauss(src, w, h, sigma) {
+  const passes = 3;
+  const ideal = Math.sqrt((12 * sigma * sigma) / passes + 1);
+  let lower = Math.floor(ideal);
+  if (lower % 2 === 0) lower--;
+  const narrow = Math.round((12 * sigma * sigma - passes * lower * lower - 4 * passes * lower - 3 * passes) / (-4 * lower - 4));
+  let a = Float32Array.from(src), b = new Float32Array(w * h);
+  for (let p = 0; p < passes; p++) {
+    const r = ((p < narrow ? lower : lower + 2) - 1) / 2;
+    for (let y = 0; y < h; y++) boxBlurLine(a, b, y * w, 1, w, r);
+    for (let x = 0; x < w; x++) boxBlurLine(b, a, x, w, h, r);
+  }
+  return a;
+}
+
+/** One box blur of radius r along a line of `len` pixels (start, start+stride, …), edges repeated. */
+function boxBlurLine(src, dst, start, stride, len, r) {
+  const at = (k) => src[start + clamp(k, 0, len - 1) * stride];
+  let sum = 0;
+  for (let k = -r; k <= r; k++) sum += at(k);
+  const inv = 1 / (2 * r + 1);
+  for (let k = 0; k < len; k++) {
+    dst[start + k * stride] = sum * inv;
+    sum += at(k + r + 1) - at(k - r);
+  }
 }
 
 /**
@@ -2084,6 +2135,38 @@ function edgeTangentFlow(L, w, h, sigma) {
 }
 
 /**
+ * Where is the photo busy TEXTURE rather than real STRUCTURE? (0–1 per pixel)
+ * Uses the same structure tensor as edgeTangentFlow, averaged over a wider
+ * window (sigma):
+ *   - energy: how strong the gradients are there (≈ local contrast);
+ *   - coherence: how much they agree on one direction (0 = every which way,
+ *     1 = all parallel).
+ * Real structure (an edge, hair strands, wood grain, stripes) is coherent.
+ * Busy texture (carpet, lace, gravel, leaves) is strong but incoherent. An
+ * artist simplifies texture into a clean fill with just a hint of pattern,
+ * but draws structure. Very strong, bold patterns (a printed pillow) count
+ * as design, not texture, and are kept. Returns { texture, coherence, energy }.
+ */
+function textureMap(L, w, h, sigma) {
+  const { magnitude, direction } = sobelEdges(L, w, h);
+  const n = w * h;
+  let E = new Float32Array(n), F = new Float32Array(n), G = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const gx = magnitude[i] * Math.cos(direction[i]), gy = magnitude[i] * Math.sin(direction[i]);
+    E[i] = gx * gx; F[i] = gx * gy; G[i] = gy * gy;
+  }
+  E = gaussianBlurSigma(E, w, h, sigma); F = gaussianBlurSigma(F, w, h, sigma); G = gaussianBlurSigma(G, w, h, sigma);
+  const texture = new Float32Array(n), coherence = new Float32Array(n), energy = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const trace = E[i] + G[i];
+    coherence[i] = trace > 1e-6 ? Math.sqrt((E[i] - G[i]) ** 2 + 4 * F[i] * F[i]) / trace : 0;
+    energy[i] = Math.sqrt(trace);
+    texture[i] = smoothstep(0.5, 0.25, coherence[i]) * smoothstep(3, 7, energy[i]) * smoothstep(36, 22, energy[i]);
+  }
+  return { texture, coherence, energy };
+}
+
+/**
  * Smooth a signal along the flow field: from each pixel, take small steps
  * forward and backward along the tangent direction (a "streamline", like
  * following a current), and average the values met on the way with Gaussian
@@ -2116,6 +2199,52 @@ function flowSmooth(src, tx, ty, w, h, length) {
     }
   }
   return out;
+}
+
+/**
+ * flowSmooth for several channels at once (they share each streamline walk),
+ * changing them in place: every pixel moves toward its smoothed value by its
+ * `weights` value (0–1). Pixels with weight 0 are skipped, which keeps this
+ * fast when only part of the picture needs it.
+ * It's also edge-aware: values along the streamline count less the more they
+ * differ from the starting pixel in the first channel (by about `edge`), so
+ * a streamline that wanders across an edge (out of a white lamp into a dark
+ * wall) doesn't drag the other side's color in.
+ */
+function flowSmoothBlend(chans, tx, ty, w, h, length, weights, edge = 8) {
+  const steps = Math.max(2, Math.round(length));
+  const sigma = steps / 2;
+  const wts = [];
+  for (let k = 0; k <= steps; k++) wts.push(Math.exp(-(k * k) / (2 * sigma * sigma)));
+  const src = chans.map((c) => Float32Array.from(c)); // read from unchanged copies
+  const sums = new Float64Array(chans.length);
+  const key = src[0], inv2e2 = 1 / (2 * edge * edge);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i0 = y * w + x;
+      const blend = weights[i0];
+      if (blend < 0.01) continue;
+      for (let c = 0; c < src.length; c++) sums[c] = src[c][i0] * wts[0];
+      let wsum = wts[0];
+      for (const dir of [1, -1]) {
+        let px = x, py = y, vx = tx[i0] * dir, vy = ty[i0] * dir;
+        for (let k = 1; k <= steps; k++) {
+          px += vx; py += vy;
+          const ix = Math.round(px), iy = Math.round(py);
+          if (ix < 0 || iy < 0 || ix >= w || iy >= h) break;
+          const j = iy * w + ix;
+          let nx = tx[j], ny = ty[j];
+          if (nx * vx + ny * vy < 0) { nx = -nx; ny = -ny; }
+          vx = nx; vy = ny;
+          const diff = key[j] - key[i0];
+          const wk = wts[k] * Math.exp(-diff * diff * inv2e2);
+          for (let c = 0; c < src.length; c++) sums[c] += src[c][j] * wk;
+          wsum += wk;
+        }
+      }
+      for (let c = 0; c < src.length; c++) chans[c][i0] += (sums[c] / wsum - chans[c][i0]) * blend;
+    }
+  }
 }
 
 /**
@@ -2193,12 +2322,86 @@ function thinLines(bin, w, h) {
 }
 
 /**
+ * Soft masks (0–1 per pixel) from the face landmarks:
+ *   features:  the eyes and the inside of the mouth. They're kept true to
+ *              the photo (no heavy smoothing, glare correction or color
+ *              banding), so eye color and a smile's teeth survive.
+ *   faceInner: the inside of the face, away from the eyes, brows, lower
+ *              nose and lips. Stray sketch lines there (like a shadow edge
+ *              across a cheek) are softened; the features keep theirs.
+ */
+function faceMasks(faces, w, h) {
+  const c = makeCanvas(w, h);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const shape = (pts, idx, sx, sy) => {
+    const p = pick(pts, idx), mid = centroid(p);
+    ctx.beginPath();
+    smoothClosedPath(ctx, scaleAbout(p, mid.x, mid.y, sx, sy));
+    ctx.fill();
+  };
+  const read = () => {
+    const a = ctx.getImageData(0, 0, w, h).data;
+    return Float32Array.from({ length: w * h }, (_, i) => a[i * 4 + 3] / 255);
+  };
+  for (const pts of faces) {
+    shape(pts, LM.rightEye, 1.3, 1.7);
+    shape(pts, LM.leftEye, 1.3, 1.7);
+    shape(pts, LM.lipsInner, 1.1, 1.3);
+  }
+  const features = blurTimes(read(), w, h, 2);
+
+  ctx.clearRect(0, 0, w, h);
+  for (const pts of faces) shape(pts, LM.faceOval, 0.86, 0.86);
+  ctx.globalCompositeOperation = 'destination-out'; // cut the features back out
+  for (const pts of faces) {
+    shape(pts, LM.rightEye, 1.8, 2.8);
+    shape(pts, LM.leftEye, 1.8, 2.8);
+    shape(pts, LM.rightBrow, 1.3, 2.2);
+    shape(pts, LM.leftBrow, 1.3, 2.2);
+    shape(pts, LM.lipsOuter, 1.3, 1.6);
+    // The lower half of the nose (tip, nostrils and the bottom of its sides):
+    // an ellipse from mid-bridge to just under the nose, tilted with the face.
+    const top = lerpPt(pts[6], pts[4], 0.45), bottom = pts[LM.noseBottom];
+    const len = dist(top, bottom);
+    ctx.beginPath();
+    ctx.ellipse((top.x + bottom.x) / 2, (top.y + bottom.y) / 2, len * 0.62, dist(pts[LM.noseRight], pts[LM.noseLeft]) * 0.72,
+      Math.atan2(bottom.y - top.y, bottom.x - top.x), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const faceInner = blurTimes(read(), w, h, 3);
+  return { features, faceInner };
+}
+
+/**
+ * The iris color in the photo: the average of a ring between the pupil and
+ * the iris edge, using only its darker pixels (that skips the catchlight and
+ * any eyelid or eye white that overlaps the ring). Returns [r, g, b] or null.
+ */
+function irisColor(rgba, w, h, pts, center, edge) {
+  const c = pts[center], r = pick(pts, edge).reduce((s, p) => s + dist(p, c), 0) / 4;
+  const px = [];
+  for (let y = Math.floor(c.y - r); y <= c.y + r; y++) {
+    for (let x = Math.floor(c.x - r); x <= c.x + r; x++) {
+      const d = Math.hypot(x - c.x, y - c.y);
+      if (d < r * 0.3 || d > r * 0.85 || x < 0 || y < 0 || x >= w || y >= h) continue;
+      const j = (y * w + x) * 4;
+      px.push([rgba[j], rgba[j + 1], rgba[j + 2]]);
+    }
+  }
+  if (px.length < 6) return null;
+  const lum = (p) => 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+  px.sort((a, b) => lum(a) - lum(b));
+  const part = px.slice(Math.floor(px.length * 0.15), Math.ceil(px.length * 0.5));
+  return [0, 1, 2].map((ch) => Math.round(part.reduce((s, p) => s + p[ch], 0) / part.length));
+}
+
+/**
  * Illustration face refinement, drawn on top with the face landmarks: the
  * details a digital illustrator emphasizes. Everything is blended gently
  * (multiply for darkening, screen for highlights) so the person's own eyes,
  * brows and lips still show through. It sharpens them without replacing them.
  */
-function refineFace(ctx, pts) {
+function refineFace(ctx, pts, opts = {}) {
   const unit = (dist(pts[33], pts[133]) + dist(pts[263], pts[362])) / 2;
   if (unit < 5) return;
   ctx.save();
@@ -2242,6 +2445,7 @@ function refineFace(ctx, pts) {
     { ring: LM.rightEye, iris: LM.rightIris, edge: LM.rightIrisEdge },
     { ring: LM.leftEye, iris: LM.leftIris, edge: LM.leftIrisEdge },
   ];
+  eyes.forEach((e, k) => { e.color = opts.irisColors ? opts.irisColors[k] : null; });
   for (const e of eyes) {
     const ring = pick(pts, e.ring);
     const ew = dist(ring[0], ring[8]);
@@ -2264,6 +2468,13 @@ function refineFace(ctx, pts) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
       ctx.fillRect(ic.x - ew, ic.y - ew, ew * 2, ew * 2);
       ctx.globalCompositeOperation = 'multiply';
+      if (e.color) {
+        // The person's own iris color from the photo, deepened (multiplying a
+        // color by itself makes it darker and richer): brown eyes stay brown,
+        // blue eyes stay blue.
+        ctx.fillStyle = `rgba(${e.color[0]}, ${e.color[1]}, ${e.color[2]}, 0.6)`;
+        ctx.beginPath(); ctx.arc(ic.x, ic.y, ir * 0.95, 0, Math.PI * 2); ctx.fill();
+      }
       ctx.fillStyle = 'rgba(40, 25, 20, 0.45)';
       ctx.beginPath(); ctx.arc(ic.x, ic.y, ir * 0.45, 0, Math.PI * 2); ctx.fill();
       ctx.strokeStyle = 'rgba(30, 18, 14, 0.55)';
@@ -2305,12 +2516,15 @@ function refineFace(ctx, pts) {
   }
 
   // Lips: a little richer color, a defined parting line, and a gloss highlight.
+  // Only the lips themselves are tinted (outer outline minus the inner one,
+  // the "evenodd" fill rule), so the teeth in a smile stay white.
   const outer = pick(pts, LM.lipsOuter);
   ctx.globalCompositeOperation = 'multiply';
   ctx.fillStyle = 'rgba(200, 95, 100, 0.32)';
   ctx.beginPath();
   smoothClosedPath(ctx, outer);
-  ctx.fill();
+  smoothClosedPath(ctx, pick(pts, LM.lipsInner));
+  ctx.fill('evenodd');
   ctx.globalCompositeOperation = 'source-over';
   ctx.strokeStyle = 'rgba(70, 28, 28, 0.45)';
   ctx.lineWidth = unit * 0.04;
@@ -2326,6 +2540,21 @@ function refineFace(ctx, pts) {
   ctx.beginPath();
   ctx.ellipse(shine.x, shine.y, unit * 0.28, unit * 0.1, 0, 0, Math.PI * 2);
   ctx.fill();
+
+  // Pencil sketches (the Cartoon) suggest the nose the way artists do: two
+  // light curves for the nostril wings, from the side of the nose curling in
+  // under it. (The nose is soft in most photos, so the traced lines often
+  // miss it.)
+  if (opts.noseSketch) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = 'rgba(58, 50, 52, 0.55)';
+    ctx.lineWidth = unit * 0.045;
+    for (const wing of [[48, 64, 98, 97], [278, 294, 327, 326]]) {
+      ctx.beginPath();
+      smoothOpenPath(ctx, pick(pts, wing));
+      ctx.stroke();
+    }
+  }
 
   // Nose: a soft highlight on the tip.
   const tip = pts[4];
@@ -2369,22 +2598,32 @@ function pencilStreaks(flow, w, h, length) {
  *   Illustration: gentle smoothing, soft many-level shading, colored ink.
  *   Cartoon: stronger flattening, 2–3 clear shading tones per area ("cel
  *   shading"), pencil-sketch lines with a graphite texture, on paper.
+ * Skin settings: skinRich / skinWarm = how much richer (×) and warmer (+)
+ * the evened skin tone gets; skinCurve = how much of the contrast curve skin
+ * gets (1 = all). The Cartoon keeps skin close to the person's real tone.
+ * flattenTexture / keepStructure (Cartoon only): how strongly busy texture
+ * is flattened, and how much directional background structure (streaks,
+ * wood grain) is protected from smearing. See textureMap.
  */
 const STYLE_PRESETS = {
   illustration: {
     mode: 'illustration',
     sigmaS: 32, sigmaR: { bg: 26, skin: 20, hair: 8, other: 11, even: 16 },
     chromaBlur: 1.2, vibrance: 1.3, vibranceMuted: 0.55, skinVibrance: 1.15, warm: 1,
+    skinRich: 1.1, skinWarm: 2, skinCurve: 1,
     levels: 12, sharpness: 2.2, mixPerson: 0.45, mixBg: 0.8, mixEven: 0.55,
     sCurve: 0.42, gamma: 1.07, lighten: 0,
+    flattenTexture: 0, keepStructure: 0,
     lines: 'ink',
   },
   cartoon: {
     mode: 'cartoon',
     sigmaS: 44, sigmaR: { bg: 34, skin: 28, hair: 12, other: 18, even: 24 },
-    chromaBlur: 2.4, vibrance: 1.32, vibranceMuted: 0.6, skinVibrance: 1.16, warm: 0.8,
+    chromaBlur: 2.4, vibrance: 1.25, vibranceMuted: 0.3, skinVibrance: 1.02, warm: 0.6,
+    skinRich: 1, skinWarm: 1, skinCurve: 0.5,
     levels: 6, sharpness: 3.4, mixPerson: 0.85, mixBg: 0.9, mixEven: 0.88,
     sCurve: 0.25, gamma: 1.0, lighten: 0.14,
+    flattenTexture: 4, keepStructure: 0.8,
     lines: 'pencil',
   },
 };
@@ -2455,6 +2694,33 @@ async function buildStylized(image, detail, onStatus, preset) {
   await nextFrame();
   const lab = rgbaToLab(photo);
   const guide = [new Float32Array(lab.L), new Float32Array(lab.A), new Float32Array(lab.B)];
+  const { features, faceInner } = faces.length ? faceMasks(faces, w, h) : { features: null, faceInner: null };
+
+  // The pencil sketch is traced from a LIGHTLY smoothed copy of the photo (so
+  // fine detail survives). Its edge flow also shows where the photo has real
+  // structure and where it's only busy texture (textureMap).
+  let lineL = null, flow = null, tex = null, along = null, lineSourceL = null;
+  if (preset.lines === 'pencil') {
+    lineSourceL = new Float32Array(guide[0]); // the photo's own lightness, untouched
+    lineL = new Float32Array(guide[0]);
+    domainTransformSmooth([lineL], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
+    flow = edgeTangentFlow(lineL, w, h, 3 * scale);
+    tex = textureMap(lineL, w, h, 8 * scale);
+
+    // Directional texture in the background (wall streaks, wood grain):
+    // smooth it ALONG its own direction first, so it turns into clean,
+    // simple streaks of color, and then smooth it less in the main pass
+    // below (which would otherwise smear the streaks into blotches).
+    if (preset.keepStructure > 0) {
+      along = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        along[i] = smoothstep(0.6, 0.8, tex.coherence[i]) * smoothstep(1.2, 2.2, tex.energy[i]) * (person ? 1 - clamp(person[i], 0, 1) : 1);
+      }
+      along = blurTimes(along, w, h, 3);
+      flowSmoothBlend([lab.L, lab.A, lab.B], flow.tx, flow.ty, w, h, 14 * scale, along);
+      for (let c = 0; c < 3; c++) guide[c].set([lab.L, lab.A, lab.B][c]);
+    }
+  }
 
   // Per-pixel "edge sensitivity" (sigmaR, in Lab units): bigger = smoother.
   // The Edge detail slider scales it: more detail → less smoothing.
@@ -2462,17 +2728,30 @@ async function buildStylized(image, detail, onStatus, preset) {
   const R = preset.sigmaR;
   const sigmaR = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    if (!person) { sigmaR[i] = R.even * detailFactor; continue; }
-    const p = clamp(person[i], 0, 1), s = clamp(skin[i], 0, 1), hr = clamp(hair[i], 0, 1);
-    const other = Math.max(0, 1 - s - hr);
-    const personR = R.skin * s + R.hair * hr + R.other * other; // skin smooth, hair detailed, clothes in between
-    sigmaR[i] = ((1 - p) * R.bg + p * personR) * detailFactor;   // background more painterly
+    let r = R.even, notSkinOrHair = 1;
+    if (person) {
+      const p = clamp(person[i], 0, 1), s = clamp(skin[i], 0, 1), hr = clamp(hair[i], 0, 1);
+      const other = Math.max(0, 1 - s - hr);
+      const personR = R.skin * s + R.hair * hr + R.other * other; // skin smooth, hair detailed, clothes in between
+      r = (1 - p) * R.bg + p * personR;                             // background more painterly
+      notSkinOrHair = 1 - clamp(p * (s + hr), 0, 1);
+    }
+    // Busy texture (carpet, lace) is flattened into a clean fill, the way an
+    // artist colors it in; streaks (above) are smoothed less, so they stay.
+    if (tex) r *= 1 + preset.flattenTexture * tex.texture[i] * notSkinOrHair;
+    if (along) r *= 1 - preset.keepStructure * along[i];
+    sigmaR[i] = r * detailFactor;
+    if (features) sigmaR[i] += (4 - sigmaR[i]) * features[i]; // eyes and teeth stay crisp
   }
   domainTransformSmooth([lab.L, lab.A, lab.B], guide, w, h, preset.sigmaS * scale, sigmaR, 3);
 
   // Clean, richer color: blur the color axes a little (removes blotchy color
   // noise, like a painter's even color fills). More blur = flatter fills.
   const A = gaussianBlurSigma(lab.A, w, h, preset.chromaBlur * scale), B = gaussianBlurSigma(lab.B, w, h, preset.chromaBlur * scale);
+  if (features) {
+    // …but not in the eyes: blurring a small iris with the eye white turns it gray.
+    for (let i = 0; i < n; i++) { A[i] += (lab.A[i] - A[i]) * features[i]; B[i] += (lab.B[i] - B[i]) * features[i]; }
+  }
   const L = lab.L;
   const skinInner = skin ? blurTimes(Float32Array.from(skin, (v) => (v > 0.5 ? 1 : 0)), w, h, 3) : null;
 
@@ -2481,9 +2760,10 @@ async function buildStylized(image, detail, onStatus, preset) {
   // soft shading. So in skin areas we (1) compress highlights above the
   // skin's typical lightness, and (2) pull the glare's washed-out color back
   // toward the skin's real mid-tone color.
+  // (The eyes and teeth are left out: their whites are bright on purpose.)
   if (skin) {
     const vals = [];
-    for (let i = 0; i < n; i += 3) if (skin[i] > 0.6) vals.push(i);
+    for (let i = 0; i < n; i += 3) if (skin[i] > 0.6 && !(features && features[i] > 0.1)) vals.push(i);
     if (vals.length > 200) {
       vals.sort((a, b) => L[a] - L[b]);
       // Reference = the 35th-percentile skin lightness. (Not the median: with
@@ -2491,9 +2771,10 @@ async function buildStylized(image, detail, onStatus, preset) {
       const ref = L[vals[Math.floor(vals.length * 0.35)]];
       let sa = 0, sb = 0, cnt = 0;
       for (let k = Math.floor(vals.length * 0.2); k < Math.floor(vals.length * 0.5); k++) { sa += A[vals[k]]; sb += B[vals[k]]; cnt++; }
-      sa = (sa / cnt) * 1.1; sb = (sb / cnt) * 1.1 + 2; // the real skin color, a touch richer and warmer
+      // The real skin color (optionally a touch richer and warmer, see the presets).
+      sa = (sa / cnt) * preset.skinRich; sb = (sb / cnt) * preset.skinRich + preset.skinWarm;
       for (let i = 0; i < n; i++) {
-        const s = clamp(skin[i], 0, 1);
+        const s = clamp(skin[i], 0, 1) * (features ? 1 - features[i] : 1);
         if (s < 0.05 || L[i] <= ref) continue;
         const over = L[i] - ref;
         const t = clamp(over / 20, 0, 1) * 0.9 * s; // how much of this pixel is glare
@@ -2514,7 +2795,7 @@ async function buildStylized(image, detail, onStatus, preset) {
     const neutralGuard = clamp((chroma - 1.5) / 3, 0, 1);
     let k = preset.vibrance + preset.vibranceMuted * Math.exp(-chroma / 16);
     if (skin) k -= (k - preset.skinVibrance) * clamp(skin[i], 0, 1);
-    k = 1 + (k - 1) * neutralGuard;
+    k = 1 + (k - 1) * neutralGuard * (features ? 1 - features[i] : 1); // eye color stays true
     A[i] *= k; B[i] *= k;
   }
   // A warm grade: nudge the midtones toward warm (a little more yellow/red),
@@ -2531,14 +2812,11 @@ async function buildStylized(image, detail, onStatus, preset) {
   // Lines. The Edge detail slider sets how many.
   onStatus(preset.lines === 'pencil' ? 'Sketching in pencil…' : 'Inking…');
   await nextFrame();
-  let ink, flow;
+  let ink;
   if (preset.lines === 'pencil') {
-    // Pencil sketch of the photo as it is: traced from a LIGHTLY smoothed
-    // copy (so fine detail survives), with the flow-based ink method from
-    // Line art: a main layer of flowing lines plus a finer detail layer.
-    const lineL = new Float32Array(guide[0]);
-    domainTransformSmooth([lineL], guide, w, h, 16 * scale, 3 + (1 - d) * 6, 3);
-    flow = edgeTangentFlow(lineL, w, h, 3 * scale);
+    // Pencil sketch of the photo as it is, traced from lineL (above) with the
+    // flow-based ink method from Line art: a main layer of flowing lines plus
+    // a finer detail layer.
     const main = xdogLines(lineL, w, h, 1.0 * scale, { tau: 1, eps: -1.3 + d * 0.8, phi: 2.2, flow: { ...flow, length: 14 * scale } });
     const fine = xdogLines(lineL, w, h, 0.6 * scale, { tau: 1, eps: -1.0 + d * 0.7, phi: 2.2, flow: { ...flow, length: 10 * scale } });
     const combined = new Float32Array(n);
@@ -2559,8 +2837,21 @@ async function buildStylized(image, detail, onStatus, preset) {
         ink[i] = v;
       }
     }
-    if (skinInner) {
-      for (let i = 0; i < n; i++) ink[i] = 1 - (1 - ink[i]) * (1 - 0.3 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1));
+    // Keep the lines an artist would draw, and only hint at the rest:
+    //  - busy texture (carpet, lace) gets a light hint of its pattern, not
+    //    scribbles (hair strands are kept: they ARE the hair);
+    //  - faint marks where the photo has almost no contrast fade out, unless
+    //    they follow a clear direction (wall streaks, wood grain);
+    //  - inside the face, stray lines like a shadow edge across a cheek are
+    //    softened, while the eyes, brows, nose tip and lips keep theirs;
+    //  - smooth skin keeps most of its lines (a sketch shows the face).
+    for (let i = 0; i < n; i++) {
+      const hairOrSkin = person ? clamp((hair[i] + skin[i]) * 1.5, 0, 1) : 0;
+      let keep = 1 - 0.45 * tex.texture[i] * (1 - hairOrSkin);
+      keep *= 0.3 + 0.7 * Math.max(smoothstep(1.5, 3.5, tex.energy[i]), 0.7 * smoothstep(0.65, 0.85, tex.coherence[i]));
+      if (faceInner) keep *= 1 - 0.5 * faceInner[i];
+      if (skinInner) keep *= 1 - 0.3 * clamp(skinInner[i] * 1.2 - 0.2, 0, 1);
+      ink[i] = 1 - (1 - ink[i]) * keep;
     }
   } else {
     // Ink traced from the smoothed lightness BEFORE sharpening (so hair
@@ -2578,17 +2869,20 @@ async function buildStylized(image, detail, onStatus, preset) {
   // between the image and a blurred copy).
   const Lb = gaussianBlurSigma(L, w, h, 1.6 * scale);
   for (let i = 0; i < n; i++) {
-    const amount = person
+    let amount = person
       ? 0.35 * (1 - (skinInner ? skinInner[i] : 0)) + 0.5 * clamp(hair[i], 0, 1) + 0.25 * clamp(clothes[i], 0, 1)
       : 0.35;
+    if (features) amount += 0.3 * features[i]; // crisp eyes and teeth
     L[i] = clamp(L[i] + (L[i] - Lb[i]) * amount, 0, 100);
   }
 
   // Shading bands: a few clear tones (cartoon) or soft many-level shading
-  // (illustration); the background is stepped more than the person.
+  // (illustration); the background is stepped more than the person. The
+  // eyes and teeth keep their own real shading.
   const mix = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     mix[i] = person ? preset.mixPerson + (preset.mixBg - preset.mixPerson) * (1 - clamp(person[i], 0, 1)) : preset.mixEven;
+    if (features) mix[i] *= 1 - features[i];
   }
   softQuantize(L, preset.levels, preset.sharpness, mix);
 
@@ -2597,12 +2891,16 @@ async function buildStylized(image, detail, onStatus, preset) {
   // slight lightening for the Cartoon's colored-in-on-paper feel.
   for (let i = 0; i < n; i++) {
     const x = clamp(L[i] / 100, 0, 1);
-    const s = Math.pow(x - (preset.sCurve * Math.sin(2 * Math.PI * x)) / (2 * Math.PI), preset.gamma);
+    const sk = skin ? clamp(skin[i], 0, 1) : 0;
+    const curve = preset.sCurve * (1 - (1 - preset.skinCurve) * sk); // skin can get a gentler curve
+    const s = Math.pow(x - (curve * Math.sin(2 * Math.PI * x)) / (2 * Math.PI), preset.gamma);
     // Lighten midtones and highlights only (a smooth ramp from 15% to 45%
-    // lightness), so dark hair and clothes stay dark while skin, walls and
-    // fabrics get the lighter "colored in" look.
+    // lightness), so dark hair and clothes stay dark while walls and fabrics
+    // get the lighter "colored in" look. Skin, eyes and teeth are not
+    // lightened: skin keeps the person's real tone.
     const t = clamp((s - 0.15) / 0.3, 0, 1);
-    L[i] = 100 * (s + preset.lighten * (1 - s) * t * t * (3 - 2 * t));
+    const lighten = preset.lighten * (1 - sk) * (features ? 1 - features[i] : 1);
+    L[i] = 100 * (s + lighten * (1 - s) * t * t * (3 - 2 * t));
   }
 
   onStatus('Coloring…');
@@ -2625,9 +2923,14 @@ async function buildStylized(image, detail, onStatus, preset) {
     //  - darker areas get a light layer of pencil shading that follows the
     //    form (the same streaks), like an artist shading with the side of
     //    the pencil;
+    //  - busy texture that was flattened (carpet, lace) gets a light pencil
+    //    hint of its pattern: the darker bits of the photo's fine detail,
+    //    drawn in graphite;
     //  - the whole picture sits on a subtle paper grain.
     const streak = pencilStreaks(flow, w, h, 9 * scale);
     const grain = makePaperGrain(w, h);
+    const fineDetail = gaussianBlurSigma(lineSourceL, w, h, 2.5 * scale);
+    for (let i = 0; i < n; i++) fineDetail[i] = lineSourceL[i] - fineDetail[i]; // negative = darker than around it
     const graphite = [44, 41, 46];
     for (let i = 0, j = 0; i < n; i++, j += 4) {
       let dark = 1 - ink[i];
@@ -2637,6 +2940,9 @@ async function buildStylized(image, detail, onStatus, preset) {
       const tone = clamp((45 - L[i]) / 35, 0, 1); // how dark this area is
       const shade = tone * clamp((streak[i] - 0.45) * 2.5, 0, 1) * 0.22;
       pd = 1 - (1 - pd) * (1 - shade);
+      const hairOrSkin = person ? clamp((hair[i] + skin[i]) * 1.5, 0, 1) : 0;
+      const hint = tex.texture[i] * (1 - hairOrSkin) * clamp(-fineDetail[i] / 8, 0, 1) * 0.4;
+      pd = 1 - (1 - pd) * (1 - hint);
       const g = 1 + (grain[i] - 1) * 0.7;
       for (let c = 0; c < 3; c++) painted[j + c] = (painted[j + c] * (1 - pd) + graphite[c] * pd) * g;
     }
@@ -2667,7 +2973,12 @@ async function buildStylized(image, detail, onStatus, preset) {
     const fc = makeCanvas(w, h);
     const fctx = fc.getContext('2d', { willReadFrequently: true });
     fctx.putImageData(new ImageData(painted, w, h), 0, 0);
-    for (const pts of faces) refineFace(fctx, pts);
+    for (const pts of faces) {
+      refineFace(fctx, pts, {
+        irisColors: [irisColor(photo, w, h, pts, LM.rightIris, LM.rightIrisEdge), irisColor(photo, w, h, pts, LM.leftIris, LM.leftIrisEdge)],
+        noseSketch: preset.lines === 'pencil',
+      });
+    }
     painted.set(fctx.getImageData(0, 0, w, h).data);
   }
 
