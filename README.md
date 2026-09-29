@@ -1,6 +1,6 @@
 # Photo → Drawing
 
-Turn any photo into **glowing line art**, a **colored-pencil drawing**, or a **2D animation style illustration**, and watch it get sketched and colored in live. You can save the result as an image or a video, or share it straight from your phone.
+Turn any photo into **glowing line art**, a **colored-pencil drawing**, or an **inked storybook illustration**, and watch it get sketched and colored in live. You can save the result as an image or a video, or share it straight from your phone.
 
 Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no build step. The one runtime dependency is Google's MediaPipe Tasks Vision library, which is loaded from a CDN only when it's needed.
 
@@ -12,17 +12,15 @@ Built with plain **HTML, CSS and vanilla JavaScript**: no frameworks and no buil
 
 **Works on all kinds of photos.** Every style first smooths the photo with an *edge-aware* filter, which flattens fabric patterns, carpet, skin pores and noise but keeps real edges. It then finds lines that follow the shapes' flow, and drops "texture scribbles": short lines crammed into busy areas. Long real contours are always kept. Skin is evened out toward its real mid-tone color, so camera flash, glare and shine don't wash out skin tones or turn black hair gray.
 
-**Illustration** turns the photo into a **2D animation** frame, like a still from an animated series (think of the painted look of shows like *Avatar: The Last Airbender*): the person is repainted in flat colors with crisp cel shading and bold outlines, in front of a crisp, painted version of the whole scene. It's stylized on purpose, but every shape comes from the photo, so it reads as the animated version of it and the person still looks like themselves:
-1. **Flat base colors:** edge-aware smoothing (the *domain transform*, guided by MediaPipe's body segmentation) flattens each area, skin, hair and each piece of clothing, into one clean color, while the edges between areas stay sharp. Skin gets one even tone: the person's own mid-tone skin color, so flash glare and shadows don't count.
-2. **Cel shading:** the photo's light-and-shadow shapes (lightly smoothed) are compared with each area's flat color. Where they're clearly darker, the area gets a second, darker tone with a crisp edge, a little richer in color and warmer on skin, like painted cel shadows. Hair and skin also get a lighter tone where they catch the light, and hair keeps sharper shapes, so it shows clumps and a shine. Colors get richer, except near-black (a black jacket, dark hair), which is kept close to black instead of turning muddy brown.
-3. **Bold outlines:** flow-based XDoG finds the edges between the flat areas and the strongest edges of the form (jaw, ear, the side of the nose), a few strand lines in the hair and fold lines in the clothes (found with the darks stretched, so a black dress's folds show too), plus a thick outline around the person. They're drawn in a deep shade of the color underneath (dark brown on skin, deep navy on a blue jacket).
-4. **An animated face** from the 478 face landmarks: clean white eyes with a flat iris in the person's own eye color, a dark pupil and two sparkles, solid brows, a simple nose, flat lips (teeth kept) and a soft blush.
-5. **A crisp painted background:** the scene behind the person is kept, not blurred, and painted the way animation backgrounds are, separately from the character (its smoothing stops at the person's edge, so nothing smears across it):
-   - edge-aware smoothing turns it into clean shapes with sharp edges;
-   - light and shade are laid in as crisp value shapes: each spot is compared with a much smoother version of its surroundings and pushed a step lighter or darker. Because it's relative, a wall keeps its streaks, a couch its folds and water its ripples, whatever their overall tone;
-   - busy texture (carpet, leaves, gravel) becomes a calm pattern of two close tones with crisp edges, instead of a smear;
-   - colors get a little richer, with cooler shadows and warmer lights, like a painting;
-   - thin lines in a softer shade of the color underneath mark the real edges.
+**Illustration** draws the photo as an **inked storybook illustration**, the hand-drawn look of illustrated books and animated films (and of the drawings AI image generators make from photos): crisp dark ink lines over clean watercolor-style washes, with colored-pencil hatching in the shadows, on paper, in warm light. It can't invent a new scene the way those generators do, since everything comes from your photo, but it draws the photo the way an illustrator would:
+1. **Ink lines** with flow-based XDoG (like Line art): the main contours, finer detail, and a pass that finds detail inside dark areas (black hair, a black dress) by stretching the darks. Like an artist, it inks what matters: busy texture (carpet) gets lighter lines, crowded patterns (a printed pillow) are drawn lighter so they don't turn into black blobs, and inside the face only the features keep their lines. The person gets a crisp outline, snapped to the photo's own edges so there are no dark halos.
+2. **Drawn hair:** strand lines from the photo itself, plus drawn strands that follow the hair's real direction and waves. They're made by smearing random noise along the hair's flow (*line integral convolution*, the same trick as the Cartoon's pencil streaks), which turns it into long, thin streaks. The hair's sheen (where it catches the light) is painted as bands of silvery light.
+3. **Washes:** edge-aware smoothing (the *domain transform*, guided by MediaPipe's body segmentation) turns each area into a clean color: skin smoothest, hair and clothes more detailed. Skin becomes one clean tone, the person's own, a little warmer and richer, and the face is kept cleanest. Colors get more vibrant.
+4. **Folds:** clothing folds, even in a black dress, are painted back as light and shade, smeared along the fabric so they flow instead of looking blotchy.
+5. **Soft shading:** a second, darker tone where the photo's shadows fall (softer on skin, and not across the face).
+6. **Light:** the background is painted lighter and airier (an illustrator paints even a dim room light and lets the lines carry the shapes), with warm, golden lights and cool, bluish darks, so a room glows and a night scene stays night. The person keeps real darks.
+7. **On paper:** colored-pencil hatching in the shadows (in a deeper shade of the color underneath), a subtle paper grain, and the ink on top with crisp edges.
+8. **An illustrated face** from the 478 face landmarks: clean white eyes with the person's own iris color, a dark pupil and two sparkles, solid brows, a simple nose, lips (teeth kept) and a soft blush.
 
 Being an on-device filter, it won't redraw a photo the way large generative AI image models can, but it works offline, costs nothing and never uploads your photo.
 
@@ -36,7 +34,7 @@ Being an on-device filter, it won't redraw a photo the way large generative AI i
 
 The finished picture is rendered straight from that ink, with natural thick-to-thin line weight, vivid colors from the photo and a neon glow. For the live drawing, the ink is thinned to center lines (Zhang–Suen) and traced into pen strokes, which then cross-fade into the full-detail ink. Face landmarks add exact outlines of the eyes, irises, eyelid creases, brows, nose, nostrils and lips. Dark photos are brightened for line finding only.
 
-**Cartoon** is a **colored-pencil drawing of your photo**: sketched in graphite the way it really is, then colored in with pencil strokes, the way an artist draws from a reference photo. It runs on the same engine as Illustration with a different recipe (a "preset"):
+**Cartoon** is a **colored-pencil drawing of your photo**: sketched in graphite the way it really is, then colored in with pencil strokes, the way an artist draws from a reference photo. It shares many tools with the Illustration (edge-aware smoothing, flow-based lines, hatching), with its own recipe (a "preset"):
 
 1. **Pencil lines that follow the photo as it is:** flow-based XDoG at two sizes finds the main contours and the fine detail (hair strands, folds, fingers, facial features), and tiny specks are removed. The lines are drawn in graphite gray with a real *pencil texture*: random noise smeared along the edge flow (line integral convolution), so every line looks like it's made of small parallel pencil strokes.
 2. **Clean colors:** edge-aware smoothing flattens each area into a clean fill with a few clear shading tones. The colors come from the photo: the hair, clothes and background with a gentle vibrance boost, and the person's **real skin tone**, kept close to the photo (flash glare evened out, but no lightening or orange tint).
@@ -104,7 +102,7 @@ The sections in `app.js` are:
 3. **Painting helpers**: paper grain, the "sketch first, then color it in" live drawing (coloring strokes planned patch by patch, revealed through per-area patterns), the result object
 4b. **Face & body finder**: loading MediaPipe, segmentation, face landmarks, geometry helpers
 4c. **Mode 2: Cartoon** (`buildSketchCartoon`) and the tools it shares with the Illustration: Lab color, domain-transform smoothing, texture vs. structure detection (`textureMap`), flow-aligned smoothing, face feature masks and iris color, skin-tone evening, vibrance, soft quantization, flow-based XDoG lines, detail restoration, colored-pencil grain and graphite hatching (`hatchLines`, `hatchCoverage`), speck removal, Zhang–Suen thinning (for the live pen), face refinement (`refineFace`), and the shared first and last steps (`preparePhoto`, `finishPaintedArt`)
-4d. **Mode 3: Illustration** (`buildIllustration`): the 2D animation look: flat base colors, crisp two-tone cel shading, bold outlines with hair strands and clothing folds, the animated face, a crisp painted background
+4d. **Mode 3: Illustration** (`buildIllustration`): the inked storybook look: ink lines, drawn hair strands and sheen, watercolor-style washes, painted clothing folds, warm light, colored-pencil hatching, the illustrated face
 5. Live drawing (animation)
 6. Export & sharing (video recording with the music's audio track)
 6b. **Music**: Web Audio sequencer, the four built-in songs, user song playback

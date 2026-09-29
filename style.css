@@ -176,15 +176,15 @@ body {
     #f5eede;
 }
 
-/* Illustration: a flat, outlined 2D animation character (flat skin with a
-   crisp shadow side, dark hair, a navy jacket) on a soft painted backdrop. */
+/* Illustration: an inked storybook figure (tan skin, dark hair, ink
+   outlines) with light pencil hatching, in warm, golden light. */
 .swatch-illustration {
   background:
-    linear-gradient(90deg, transparent 50%, rgba(170, 88, 66, 0.35) 50%) 50% 46% / 24px 24px no-repeat,
-    radial-gradient(circle at 50% 46%, #f2b89a 0 12px, #2a1c16 12px 13.5px, transparent 14px),
-    radial-gradient(ellipse at 50% 36%, #5a3526 0 19px, #2a1c16 19px 20.5px, transparent 21px),
-    radial-gradient(ellipse at 50% 125%, #34466e 0 30px, #1c2440 30px 31.5px, transparent 32px),
-    linear-gradient(160deg, #a9cfe0, #86a57f);
+    radial-gradient(circle at 50% 46%, #d9a07a 0 12px, #22170f 12px 13.5px, transparent 14px),
+    radial-gradient(ellipse at 50% 36%, #2b201c 0 19px, #22170f 19px 20.5px, transparent 21px),
+    radial-gradient(ellipse at 50% 125%, #eeb3a8 0 30px, #22170f 30px 31.5px, transparent 32px),
+    repeating-linear-gradient(120deg, transparent 0 7px, rgba(120, 80, 40, 0.12) 7px 8px),
+    linear-gradient(160deg, #f7e7bd, #e9c58e);
 }
 
 .field-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
