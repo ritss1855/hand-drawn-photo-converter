@@ -3078,27 +3078,39 @@ async function buildSketchCartoon(image, detail, onStatus = () => {}) {
 /* =============================================================================
    4d. MODE 3: ILLUSTRATION  —  a 2D animation look
    -----------------------------------------------------------------------------
-   Like a frame from an animated series: the person is repainted in flat
-   colors with crisp two-tone "cel" shading and clean dark outlines, and gets
-   simple animated eyes, brows, nose, mouth and blush from the landmarks. The
-   background becomes a soft painted backdrop, the way animation paints its
-   backgrounds separately from the characters.
+   Like a frame from an animated series (think of the painted look of shows
+   like Avatar): the person is redrawn in flat colors with crisp two-tone
+   "cel" shading and bold dark outlines, and gets simple animated eyes,
+   brows, nose, mouth and blush from the landmarks. The background is
+   painted in the same style but calmer, the way animation backgrounds are:
+   crisp shapes and soft tones, with light lines instead of black outlines.
+   It's stylized on purpose (simplified shapes, designed shadows, richer
+   color), while every shape still comes from the photo, so it reads as the
+   animated version of it.
 
      1. Flat base colors: every area (skin, hair, each piece of clothing) is
         smoothed until it's one clean color (edge-aware, so areas stay
         apart). Skin gets one even tone, the person's own mid-tone color.
-     2. Cel shading: where the photo's light-and-shadow shapes are darker
-        than an area's base color, that part gets a second, darker and
-        slightly richer tone with a crisp edge; hair and skin also get a
-        lighter tone where they catch the light. The shapes come from the
-        photo itself, so the person still looks like themselves.
-     3. Clean lines: XDoG finds the edges between the flat areas and the
-        strongest edges of the form (jaw, ear, the side of the nose), drawn
-        thin and dark in a deep shade of the color underneath (dark brown on
-        skin, deep navy on a blue jacket), never on the background.
+     2. Cel shading: where the photo's light-and-shadow shapes (smoothed into
+        simple, designed shapes) are darker than an area's base color, that
+        part gets a second, darker tone with a crisp edge: redder on skin,
+        cooler on clothes, like painted cel shadows. Hair and skin also get
+        a lighter tone where they catch the light. Colors get richer,
+        except near-black, which is kept close to black.
+     3. Bold lines: XDoG finds the edges between the flat areas and the
+        strongest edges of the form (jaw, ear, the side of the nose), a few
+        strand lines in the hair and fold lines in the clothes, and a
+        thicker outline around the person, all in a deep shade of the color
+        underneath (dark brown on skin, deep navy on a blue jacket).
      4. The face (refineFace with `animation`): clean eyes in the person's
         own eye color, solid brows, a simple nose, lips and blush.
-     5. Background: smoothed into soft painted shapes, with no lines.
+     5. The background, painted separately so nothing smears across the
+        person's edge: edge-aware smoothing into clean shapes (crisp, not
+        blurred), light and shade laid in as crisp value shapes (so a wall
+        keeps its streaks and water its ripples), busy texture like carpet
+        turned into a calm two-tone pattern, richer color with cooler
+        shadows and warmer lights, and thin lines in a softer shade of the
+        color underneath.
    ============================================================================= */
 
 /** Build the Illustration result from an <img>: a 2D animation look. */
@@ -3114,15 +3126,20 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   const hr = (i) => (hair ? clamp(hair[i], 0, 1) : 0);
 
   // Light-and-shadow shapes: lightness smoothed moderately (texture and
-  // noise go, the big shapes of light stay), then softened a little so the
-  // shadow edges become smooth curves. Hair keeps sharper shapes, so it
-  // shows clumps and strands instead of one soft blob.
+  // noise go, the big shapes of light stay), then softened so the shadow
+  // edges become smooth, simple curves, the way an animator designs them:
+  // simplest on skin, a little more detail on clothes, and sharper on hair,
+  // so it shows clumps and strands instead of one soft blob.
   const shapesRaw = new Float32Array(lab.L);
   domainTransformSmooth([shapesRaw], guide, w, h, 24 * scale, 7 + (1 - d) * 6, 3);
-  const shapesSoft = gaussianBlurSigma(shapesRaw, w, h, 2 * scale);
-  const shapesSharp = gaussianBlurSigma(shapesRaw, w, h, 0.8 * scale);
+  const shapesSkin = gaussianBlurSigma(shapesRaw, w, h, 3.4 * scale);
+  const shapesSoft = gaussianBlurSigma(shapesRaw, w, h, 2.4 * scale);
+  const shapesSharp = gaussianBlurSigma(shapesRaw, w, h, 1.4 * scale);
   const shapes = new Float32Array(n);
-  for (let i = 0; i < n; i++) shapes[i] = shapesSoft[i] + (shapesSharp[i] - shapesSoft[i]) * hr(i);
+  for (let i = 0; i < n; i++) {
+    const s = sk(i), hh = hr(i);
+    shapes[i] = shapesSoft[i] + (shapesSkin[i] - shapesSoft[i]) * s + (shapesSharp[i] - shapesSoft[i]) * hh;
+  }
 
   // Flat base colors: everything smoothed a lot. Skin and the background
   // flatten the most; hair and clothes keep their separate parts.
@@ -3132,7 +3149,7 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     let r = 30;
     if (person) {
       const p = clamp(person[i], 0, 1), s = sk(i), hh = hr(i), o = Math.max(0, 1 - s - hh);
-      r = (1 - p) * 40 + p * (s * 40 + hh * 11 + o * 22);
+      r = (1 - p) * 40 + p * (s * 40 + hh * 13 + o * 28);
     }
     sigmaR[i] = r * detailFactor;
     if (features) sigmaR[i] += (4 - sigmaR[i]) * features[i];
@@ -3147,7 +3164,7 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     for (let i = 0; i < n; i += 3) if (skin[i] > 0.6 && !(features && features[i] > 0.1)) idx.push(i);
     if (idx.length > 200) {
       idx.sort((a, b) => lab.L[a] - lab.L[b]);
-      const mid = idx.slice(Math.floor(idx.length * 0.25), Math.floor(idx.length * 0.6));
+      const mid = idx.slice(Math.floor(idx.length * 0.3), Math.floor(idx.length * 0.65));
       const tone = [0, 1, 2].map((c) => mid.reduce((sum, i) => sum + guide[c][i], 0) / mid.length);
       for (let i = 0; i < n; i++) {
         const t = sk(i) * 0.8 * (features ? 1 - features[i] : 1);
@@ -3159,8 +3176,9 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   // Cel shading. `diff` is how much lighter (+) or darker (−) the shapes are
   // than the flat base. Past about 4 units darker, the second (shadow) tone
   // takes over, with a soft edge only ~3 units wide, so it's crisp but not
-  // jagged. Shadows are a bit richer in color, and warmer (redder) on skin,
-  // like painted cel shadows. Eyes and teeth keep the photo.
+  // jagged. Shadows are richer in color: warmer (redder) on skin and cooler
+  // (bluer) on clothes and hair, like painted cel shadows. Colors overall
+  // get a clean boost. Eyes and teeth keep the photo.
   const L = new Float32Array(n), A = new Float32Array(n), B = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const s = sk(i), hh = hr(i);
@@ -3169,23 +3187,65 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     const light = smoothstep(7, 10, diff) * (0.35 * s + hh);
     const depth = 12 + 4 * hh;
     L[i] = base[0][i] - depth * shadow + (7 + 7 * hh) * light; // hair gets a clear shine
-    const rich = (1 + 0.2 * shadow) * (1.12 - 0.08 * s); // a gentle, cleaner color boost
-    A[i] = base[1][i] * rich + 3 * shadow * s;
-    B[i] = base[2][i] * rich - 1 * shadow * (1 - s);
+    // Near-black (a black jacket, dark hair) isn't boosted but pulled a bit
+    // toward neutral, so it reads as black instead of muddy brown.
+    const dark = smoothstep(34, 16, base[0][i]);
+    const rich = (1 + 0.2 * shadow * (1 - dark)) * (1 + (0.2 - 0.12 * s) * (1 - dark)) * (1 - 0.3 * dark);
+    A[i] = base[1][i] * rich + 3 * shadow * s + 0.8 * shadow * (1 - s);
+    B[i] = base[2][i] * rich - 3 * shadow * (1 - s);
     if (features) {
       const f = features[i];
       L[i] += (lab.L[i] - L[i]) * f; A[i] += (lab.A[i] - A[i]) * f; B[i] += (lab.B[i] - B[i]) * f;
     }
   }
-
-  // The background: a soft painted backdrop (big, gently blended shapes).
-  // The person is placed on it with a crisp edge.
-  let fg = null;
+  // The background, painted in the same animated style but calmer than the
+  // person, the way animation backgrounds are: smoothed edge-aware into
+  // clean shapes (crisp, not blurred), with its light and shade laid in as
+  // crisp shapes too, and richer colors with cooler shadows and warmer
+  // lights, like a painting. Its lines come later.
+  let fg = null, bgLines = null, tex = null;
   if (person) {
-    const bg = [new Float32Array(lab.L), new Float32Array(lab.A), new Float32Array(lab.B)];
-    domainTransformSmooth(bg, guide, w, h, 40 * scale, 34, 3);
-    for (let c = 0; c < 3; c++) bg[c] = gaussianBlurSigma(bg[c], w, h, 2.5 * scale);
-    fg = blurTimes(Float32Array.from(person, (v) => (v > 0.5 ? 1 : 0)), w, h, 1);
+    onStatus('Painting the background…');
+    await nextFrame();
+    // Where the person is, with a crisp edge. The background's smoothing
+    // stops at that edge, so the person's colors don't smear into it.
+    const hard = Float32Array.from(person, (v) => (v > 0.5 ? 1 : 0));
+    fg = blurTimes(hard, w, h, 1);
+    // Busy texture (carpet, gravel, leaves) is found so it can be simplified
+    // (see textureMap).
+    tex = textureMap(lab.L, w, h, 8 * scale);
+    const bg = guide.map((g) => new Float32Array(g));
+    const bgGuide = [...guide, Float32Array.from(hard, (v) => v * 100)];
+    const bgSigmaR = Float32Array.from(tex.texture, (t) => (16 + 8 * t) * detailFactor);
+    domainTransformSmooth(bg, bgGuide, w, h, 32 * scale, bgSigmaR, 3);
+    // Its lines: the real edges between the painted shapes, found before
+    // the light and shade below adds steps of its own (so a smooth lamp
+    // globe doesn't get a line across it).
+    const bgFlow = edgeTangentFlow(bg[0], w, h, 3 * scale);
+    bgLines = xdogLines(bg[0], w, h, 1.0 * scale, { tau: 1, eps: -1.2 + d * 0.7, phi: 2.4, flow: { ...bgFlow, length: 14 * scale } });
+    removeInkSpecks(bgLines, w, h, Math.round(24 * scale * scale));
+    // Light and shade laid in as crisp shapes, the way a painter lays in
+    // values: each spot is compared with a much smoother version of its
+    // surroundings and pushed a step lighter or darker (a soft step, via
+    // tanh). Because it's relative, every area keeps its own streaks, folds
+    // and ripples, whatever its overall tone. Busy texture becomes two close
+    // tones with crisp edges around its own color (a calm pattern, like
+    // painted leaves or a carpet), taken from a barely smoothed copy so the
+    // edges stay crisp instead of smeared.
+    const coarse = new Float32Array(bg[0]);
+    domainTransformSmooth([coarse], bgGuide, w, h, 48 * scale, 30 * detailFactor, 2);
+    const patternL = gaussianBlurSigma(lab.L, w, h, 2 * scale);
+    for (let i = 0; i < n; i++) {
+      const shaded = bg[0][i] + 5 * Math.tanh((bg[0][i] - coarse[i]) / 2);
+      const pattern = bg[0][i] + 4 * Math.tanh((patternL[i] - bg[0][i]) / 1.5);
+      bg[0][i] = shaded + (pattern - shaded) * tex.texture[i];
+    }
+    for (let i = 0; i < n; i++) {
+      const k = 1 + 0.25 * clamp((Math.hypot(bg[1][i], bg[2][i]) - 1.5) / 3, 0, 1); // true grays stay gray
+      bg[1][i] *= k;
+      bg[2][i] = bg[2][i] * k + 4 * clamp((bg[0][i] - 50) / 40, -1, 1); // bluer shadows, warmer lights
+    }
+    // The person goes on top.
     for (let i = 0; i < n; i++) {
       const f = fg[i];
       L[i] = bg[0][i] + (L[i] - bg[0][i]) * f;
@@ -3194,10 +3254,10 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
     }
   }
 
-  // Clean lines: edges between the flat areas (XDoG on the flat base) plus
+  // Bold lines: edges between the flat areas (XDoG on the flat base) plus
   // the strongest edges of the form (XDoG on the shapes, strict threshold),
-  // and the person's outline. Specks go, and there are no lines on the
-  // background.
+  // and a thicker outline around the person (from a slightly softened
+  // outline of its mask, so it's smooth). Specks go.
   onStatus('Inking the outlines…');
   await nextFrame();
   const flow = edgeTangentFlow(shapes, w, h, 3 * scale);
@@ -3205,16 +3265,39 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   const formEdges = xdogLines(shapes, w, h, 1.1 * scale, { tau: 1, eps: -1.5 + d * 0.8, phi: 2.6, flow: { ...flow, length: 14 * scale } });
   let outline = null;
   if (fg) {
-    const { magnitude } = sobelEdges(fg, w, h);
-    outline = Float32Array.from(magnitude, (m) => clamp((m - 0.5) * 0.5, 0, 0.8));
+    const { magnitude } = sobelEdges(blurTimes(fg, w, h, 2), w, h);
+    outline = Float32Array.from(magnitude, (m) => clamp((m - 0.35) * 0.6, 0, 0.95));
+  }
+  // Hair gets a few strand lines and clothes a few fold lines, the way
+  // animators draw them. They come from the photo's own fine detail, with
+  // dark tones lifted so a black dress's folds show up too.
+  let strands = null;
+  if (hair || clothes) {
+    const lifted = Float32Array.from(lab.L, (v) => 10 * Math.sqrt(Math.max(0, v)));
+    const fineL = new Float32Array(lifted);
+    domainTransformSmooth([fineL], [lifted], w, h, 6 * scale, 6, 2);
+    const fineFlow = edgeTangentFlow(gaussianBlurSigma(fineL, w, h, 1.2 * scale), w, h, 3 * scale);
+    strands = xdogLines(fineL, w, h, 0.7 * scale, { tau: 1, eps: -0.65 + d * 0.3, phi: 2.6, flow: { ...fineFlow, length: 12 * scale } });
   }
   const ink = new Float32Array(n);
-  for (let i = 0; i < n; i++) ink[i] = Math.min(flatEdges[i], formEdges[i]);
+  for (let i = 0; i < n; i++) {
+    ink[i] = Math.min(flatEdges[i], formEdges[i]);
+    if (strands) {
+      const where = 0.7 * smoothstep(0.4, 0.8, hr(i)) + 0.45 * (clothes ? smoothstep(0.4, 0.8, clothes[i]) : 0);
+      ink[i] = Math.min(ink[i], 1 - (1 - strands[i]) * Math.min(0.7, where));
+    }
+  }
   removeInkSpecks(ink, w, h, Math.round(14 * scale * scale));
+  // Only the person keeps these lines (the background has its own), plus
+  // the outline.
   const onPerson = fg ? blurTimes(fg, w, h, 2) : null;
+  const bgInk = new Float32Array(n).fill(1);
   for (let i = 0; i < n; i++) {
     let dark = 1 - ink[i];
-    if (onPerson) dark *= clamp(onPerson[i] * 1.6 - 0.3, 0, 1);
+    if (onPerson) {
+      dark *= clamp(onPerson[i] * 1.6 - 0.3, 0, 1);
+      bgInk[i] = 1 - (1 - bgLines[i]) * (1 - clamp(onPerson[i] * 1.5, 0, 1)) * (1 - 0.6 * tex.texture[i]);
+    }
     if (outline) dark = Math.max(dark, outline[i]);
     ink[i] = 1 - dark;
   }
@@ -3222,12 +3305,18 @@ async function buildIllustration(image, detail, onStatus = () => {}) {
   onStatus('Coloring…');
   await nextFrame();
   const painted = labToRgba(L, A, B, new Uint8ClampedArray(n * 4));
-  // Lines in a deep shade of the color underneath.
+  // Lines in a deep shade of the color underneath: the background's are
+  // lighter and softer, the person's bold.
   for (let i = 0, j = 0; i < n; i++, j += 4) {
-    const a = 1 - ink[i];
-    if (a <= 0.01) continue;
-    for (let c = 0; c < 3; c++) painted[j + c] += (painted[j + c] * 0.22 - painted[j + c]) * a;
+    const aBg = (1 - bgInk[i]) * 0.55, a = 1 - ink[i];
+    for (let c = 0; c < 3; c++) {
+      if (aBg > 0.01) painted[j + c] += (painted[j + c] * 0.42 - painted[j + c]) * aBg;
+      if (a > 0.01) painted[j + c] += (painted[j + c] * 0.2 - painted[j + c]) * a;
+    }
   }
+  // The live sketch draws the background's lines too, so the whole scene is
+  // sketched before it's colored in.
+  for (let i = 0; i < n; i++) ink[i] = Math.min(ink[i], bgInk[i]);
 
   if (faces.length) {
     onStatus(faces.length > 1 ? `Drawing ${faces.length} faces…` : 'Drawing the face…');
